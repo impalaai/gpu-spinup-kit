@@ -1,0 +1,165 @@
+From 4e9818c4cf52a984503b1a7118bfde8f479e8743 Mon Sep 17 00:00:00 2001
+From: Tom <tom@getimpala.ai>
+Date: Sat, 10 Oct 2026 15:07:48 +0000
+Subject: [PATCH 4/6] restore: add --premap-hugepage to back premapped private
+ VMAs with THP
+
+With --premap-threads the restore task populates premapped private VMAs
+with buffered reads into 4 KiB pages. The sub-mappings carved out of the
+reserved premap area start wherever the previous VMA ended, so even with
+transparent_hugepage=always the kernel rarely finds an aligned 2 MiB
+range to fault a huge page into, and under fragmentation it falls back to
+base pages without compacting.
+
+--premap-hugepage reserves one huge page of slack per VMA, bumps every
+anonymous private VMA of at least 2 MiB to a 2 MiB boundary inside the
+area and advises MADV_HUGEPAGE on it, so the population pass writes into
+physically contiguous backing. The gaps stay PROT_NONE and are released
+with the rest of the area by the PIE restorer's unmap_old_vmas().
+
+Motivation: after a CRIU restore of a cuda-checkpoint'ed vLLM worker the
+driver repopulates VRAM from the restored host buffers at about a third
+of the rate it manages without CRIU; page contiguity (DMA scatter-list
+length) is the leading hypothesis.
+
+Assisted-by: Claude:claude-fable-5.1
+---
+ criu/config.c             |  1 +
+ criu/crtools.c            |  4 ++++
+ criu/include/cr_options.h |  6 ++++++
+ criu/mem.c                | 36 ++++++++++++++++++++++++++++++++----
+ 4 files changed, 43 insertions(+), 4 deletions(-)
+
+diff --git a/criu/config.c b/criu/config.c
+index e1f87c011..d90066f37 100644
+--- a/criu/config.c
++++ b/criu/config.c
+@@ -772,6 +772,7 @@ int parse_options(int argc, char **argv, bool *usage_error, bool *has_exec_cmd,
+ 		{ "decompress-threads", required_argument, 0, 1104 },
+ 		{ "plugin-option", required_argument, 0, 1105 },
+ 		{ "premap-threads", required_argument, 0, 1106 },
++		BOOL_OPT("premap-hugepage", &opts.premap_hugepage),
+ 		{},
+ 	};
+ 
+diff --git a/criu/crtools.c b/criu/crtools.c
+index 6978a2102..f7700bd32 100644
+--- a/criu/crtools.c
++++ b/criu/crtools.c
+@@ -514,6 +514,10 @@ usage:
+ 	       "			restore task before the PIE handoff; N > 1 reads\n"
+ 	       "			pages with N concurrent threads (default: 0 = off,\n"
+ 	       "			restore content in the PIE restorer instead).\n"
++	       "  --premap-hugepage\n"
++	       "			with --premap-threads, align premapped private\n"
++	       "			VMAs of 2 MiB or more to 2 MiB and advise\n"
++	       "			MADV_HUGEPAGE so they get transparent huge pages.\n"
+ 	       "  --skip-file-rwx-check\n"
+ 	       "			Skip checking file permissions\n"
+ 	       "			(r/w/x for u/g/o) on restore.\n"
+diff --git a/criu/include/cr_options.h b/criu/include/cr_options.h
+index 8c6649104..9832fc848 100644
+--- a/criu/include/cr_options.h
++++ b/criu/include/cr_options.h
+@@ -273,6 +273,12 @@ struct cr_options {
+ 	 * number of concurrent page-read threads.
+ 	 */
+ 	unsigned int premap_threads;
++	/*
++	 * Place premapped private VMAs of at least 2 MiB on a 2 MiB boundary
++	 * and madvise(MADV_HUGEPAGE) them so the restore task populates them
++	 * with transparent huge pages (physically contiguous backing).
++	 */
++	int premap_hugepage;
+ 
+ 	/* This stores which method to use for file validation. */
+ 	int file_validation_method;
+diff --git a/criu/mem.c b/criu/mem.c
+index 745235f58..3d383d4e9 100644
+--- a/criu/mem.c
++++ b/criu/mem.c
+@@ -943,11 +943,14 @@ void prepare_cow_vmas(void)
+ }
+ 
+ /* Map a private vma, if it is not mapped by a parent yet */
++#define PREMAP_HPAGE_SIZE (2UL << 20)
++
+ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void **tgt_addr)
+ {
+ 	int ret;
+ 	void *addr;
+ 	unsigned long nr_pages, size;
++	bool want_thp = false;
+ 
+ 	nr_pages = vma_entry_len(vma->e) / PAGE_SIZE;
+ 	vma->page_bitmap = xzalloc(BITS_TO_LONGS(nr_pages) * sizeof(long));
+@@ -970,6 +973,19 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void
+ 		 * Map a new one.
+ 		 */
+ 
++		/*
++		 * Large anonymous private VMAs: start them on a 2 MiB boundary
++		 * inside the reserved area so the kernel can back them with
++		 * transparent huge pages while the restore task populates them.
++		 */
++		if (opts.premap_hugepage && size >= PREMAP_HPAGE_SIZE &&
++		    !(vma->e->flags & MAP_HUGETLB) && !vma_area_is(vma, VMA_FILE_PRIVATE) &&
++		    !(vma->e->prot == PROT_NONE && vma_area_is(vma, VMA_AREA_NOT_ACCOUNTABLE))) {
++			*tgt_addr = (void *)(((unsigned long)*tgt_addr + PREMAP_HPAGE_SIZE - 1) &
++					     ~(PREMAP_HPAGE_SIZE - 1));
++			want_thp = true;
++		}
++
+ 		/*
+ 		 * Restore AIO ring buffer content to temporary anonymous area.
+ 		 * This will be placed in io_setup'ed AIO in restore_aio_ring().
+@@ -1008,6 +1024,8 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void
+ 			pr_perror("Unable to map ANON_VMA");
+ 			return -1;
+ 		}
++		if (want_thp && madvise(addr, size, MADV_HUGEPAGE))
++			pr_warn("Can't advise MADV_HUGEPAGE on %p(%lx): %s\n", addr, size, strerror(errno));
+ 	} else {
+ 		void *paddr;
+ 
+@@ -1523,23 +1541,33 @@ int prepare_mappings(struct pstree_item *t)
+ 
+ 	void *old_premmapped_addr = NULL;
+ 	unsigned long old_premmapped_len;
++	unsigned long rsv_size;
+ 
+ 	vmas = &rsti(t)->vmas;
+ 	if (vmas->nr == 0) /* Zombie */
+ 		goto out;
+ 
+-	/* Reserve a place for mapping private vma-s one by one */
+-	addr = mmap(NULL, vmas->rst_priv_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
++	/*
++	 * Reserve a place for mapping private vma-s one by one. With
++	 * --premap-hugepage every VMA may be bumped forward to a 2 MiB
++	 * boundary, so reserve up to one huge page of slack per VMA; the
++	 * unused tail is unmapped below and the PIE restorer unmaps the
++	 * whole area (gaps included) after moving the VMAs into place.
++	 */
++	rsv_size = vmas->rst_priv_size;
++	if (opts.premap_hugepage)
++		rsv_size += (unsigned long)vmas->nr * PREMAP_HPAGE_SIZE;
++	addr = mmap(NULL, rsv_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+ 	if (addr == MAP_FAILED) {
+ 		ret = -1;
+-		pr_perror("Unable to reserve memory (%lu bytes)", vmas->rst_priv_size);
++		pr_perror("Unable to reserve memory (%lu bytes)", rsv_size);
+ 		goto out;
+ 	}
+ 
+ 	old_premmapped_addr = rsti(t)->premmapped_addr;
+ 	old_premmapped_len = rsti(t)->premmapped_len;
+ 	rsti(t)->premmapped_addr = addr;
+-	rsti(t)->premmapped_len = vmas->rst_priv_size;
++	rsti(t)->premmapped_len = rsv_size;
+ 
+ 	ret = open_page_read(vpid(t), &pr, PR_TASK);
+ 	if (ret <= 0)
+-- 
+2.43.0
+

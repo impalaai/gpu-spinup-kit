@@ -1,0 +1,549 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Experiment 4b (Impala, 2026-10-11): per-rank byte-range weight reader on top of the pinned Run:ai staging path.
+
+For TP > 1 every rank of the stock loaders reads the WHOLE checkpoint (433 GB for GLM-5.2-NVFP4) and narrows each tensor to its
+shard afterwards; at TP=8 that read volume (8 × 433 GB through the page cache) is the weight stage. This module makes each rank
+read only the byte range its weight_loader will keep:
+
+  1. probe pass (once per model/TP/rank, cached under VLLM_CACHE_ROOT/impala-range/): `model.load_weights()` is run with
+     LazySlice placeholders (meta-device tensor subclass, no bytes read) that record the narrow(dim, start, len) each
+     weight_loader applies before consuming the tensor (copy_ / __setitem__); anything else counts as "full".
+  2. real pass: tensors whose recorded narrow is a single dim-0 slice are requested from the Run:ai C++ reader as just that
+     contiguous byte range (rows are contiguous in a row-major safetensors blob); all others are read whole. Chunks land in the
+     page-locked streamer buffer (see _impala_pin_streamer_buffer), are moved to the GPU, and are handed to the weight_loader
+     wrapped in a LazySlice that returns the pre-read slice when the loader asks for exactly the recorded narrow — and reads the
+     full tensor on the spot for any other access, so correctness never depends on the probe being right (only speed does).
+
+Gates: IMPALA_RANGE_LOADER=1 (off by default). IMPALA_RANGE_PROBE_ONLY=1 runs the probe and then the stock full read (A/B helper).
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import struct
+import time
+
+import torch
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+_META_FUNCS = None
+
+
+def _meta_funcs():
+    global _META_FUNCS
+    if _META_FUNCS is None:
+        T = torch.Tensor
+        fs = {T.dim, T.size, T.numel, T.element_size, T.__len__, T.ndimension, T.nelement, T.stride, T.is_contiguous,
+              T.is_floating_point, T.is_complex, T.__repr__, T.__format__}
+        for attr in ("shape", "dtype", "ndim", "device", "is_cuda", "is_meta", "layout", "requires_grad", "T", "mT"):
+            prop = getattr(T, attr, None)
+            if prop is not None and hasattr(prop, "__get__"):
+                fs.add(prop.__get__)
+        _META_FUNCS = fs
+    return _META_FUNCS
+
+
+class _Ctx:
+    """Per-load context: probe recorder or real-pass reader."""
+
+    def __init__(self, probe: bool, plan: dict | None = None):
+        self.probe = probe
+        self.plan = plan if plan is not None else {}
+        self.recorded: dict[str, list | None] = {}
+        self.n_full_fallback = 0
+        self.fallback_bytes = 0
+        self.n_sliced = 0
+        self.n_full = 0
+        self.reader = None  # set by RangeReader for on-demand full reads
+        self.fallback_names: list[str] = []
+
+    def record(self, name: str, view):
+        """Probe: remember the narrow a loader applied before consuming `name` (None = full / not a single-dim-0 slice)."""
+        entry = list(view) if view is not None else None
+        if name in self.recorded and self.recorded[name] != entry:
+            self.recorded[name] = None  # consumed twice with different views → full read
+        else:
+            self.recorded[name] = entry
+
+
+class LazySlice(torch.Tensor):
+    """Meta-device placeholder for one checkpoint tensor. Records narrows (probe) or serves the pre-read slice (real pass)."""
+
+    @staticmethod
+    def __new__(cls, shape, dtype, name, ctx, payload=None, pslice=None, view=None):
+        r = torch.Tensor._make_subclass(cls, torch.empty(tuple(shape), dtype=dtype, device="meta"), False)
+        r._name = name
+        r._ctx = ctx
+        r._payload = payload      # real-pass: GPU tensor holding either the full tensor (pslice None) or rows pslice
+        r._pslice = pslice        # (dim, start, len) that payload represents, or None = full
+        r._view = view            # composed narrow relative to the original tensor: None | (dim, start, len) | "multi"
+        return r
+
+    # ------------------------------------------------------------------ helpers
+    def _child(self, shape, view):
+        return LazySlice(shape, self.dtype, self._name, self._ctx, self._payload, self._pslice, view)
+
+    def _compose(self, dim, start, length):
+        if dim < 0:
+            dim += len(self.shape)
+        if self._view is None:
+            return (dim, start, length)
+        if self._view == "multi":
+            return "multi"
+        vd, vs, vl = self._view
+        if vd == dim:
+            return (dim, vs + start, length)
+        return "multi"
+
+    def _narrow(self, dim, start, length):
+        start = int(start); length = int(length)
+        shape = list(self.shape)
+        d = dim + len(shape) if dim < 0 else dim
+        shape[d] = length
+        return self._child(shape, self._compose(dim, start, length))
+
+    def _getitem(self, idx):
+        if isinstance(idx, tuple) and len(idx) == 1:
+            idx = idx[0]
+        if isinstance(idx, slice) and idx.step in (None, 1):
+            n = self.shape[0]
+            s, e, _ = idx.indices(n)
+            if s == 0 and e == n:
+                return self
+            return self._narrow(0, s, max(0, e - s))
+        if isinstance(idx, tuple) and len(idx) >= 1 and all(isinstance(i, slice) and i.step in (None, 1) for i in idx):
+            # leading slice + full trailing slices ([a:b, :]) → dim-0 narrow; anything else → materialise
+            n = self.shape[0]
+            s, e, _ = idx[0].indices(n)
+            trailing_full = all(i.indices(self.shape[k + 1]) == (0, self.shape[k + 1], 1) for k, i in enumerate(idx[1:]))
+            if trailing_full:
+                if s == 0 and e == n:
+                    return self
+                return self._narrow(0, s, max(0, e - s))
+        return self._real()[idx]
+
+    def _real(self) -> torch.Tensor:
+        """Real pass: a genuine tensor for the current view (GPU). Probe: zeros on CPU (recorded as a full consumption)."""
+        ctx = self._ctx
+        if ctx.probe:
+            ctx.record(self._name, None)
+            return torch.zeros(tuple(self.shape), dtype=self.dtype)
+        view = self._view
+        p = self._payload
+        if self._pslice is None:
+            if view is None:
+                return p
+            if view == "multi":
+                raise RuntimeError(f"[impala-range] multi-dim view on {self._name} without materialisation")
+            return p.narrow(*view)
+        # payload is a pre-read dim-0 slice
+        pd, ps, pl = self._pslice
+        if view is not None and view != "multi" and view[0] == pd and view[1] >= ps and view[1] + view[2] <= ps + pl:
+            return p if (view[1] == ps and view[2] == pl) else p.narrow(pd, view[1] - ps, view[2])
+        # anything else: read the full tensor now (correctness path; counted)
+        full = ctx.reader.read_full(self._name)
+        ctx.n_full_fallback += 1
+        ctx.fallback_bytes += full.numel() * full.element_size()
+        if len(ctx.fallback_names) < 20:
+            ctx.fallback_names.append(f"{self._name}:{view}")
+        self._payload = full
+        self._pslice = None
+        return self._real()
+
+    def _consume(self, make_result):
+        """copy_/__setitem__ consumption point."""
+        ctx = self._ctx
+        if ctx.probe:
+            ctx.record(self._name, None if self._view in (None, "multi") else self._view)
+            return None
+        return make_result(self._real())
+
+    # ------------------------------------------------------------------ dispatch
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        T = torch.Tensor
+        if func is T.narrow and isinstance(args[0], LazySlice):
+            dim = args[1] if len(args) > 1 else kwargs["dim"]
+            start = args[2] if len(args) > 2 else kwargs["start"]
+            length = args[3] if len(args) > 3 else kwargs["length"]
+            return args[0]._narrow(dim, start, length)
+        if func is T.__getitem__ and isinstance(args[0], LazySlice):
+            return args[0]._getitem(args[1])
+        if func is T.copy_ and len(args) >= 2 and isinstance(args[1], LazySlice) and not isinstance(args[0], LazySlice):
+            dst = args[0]
+            r = args[1]._consume(lambda real: dst.copy_(real, *args[2:], **kwargs))
+            return dst if r is None else r
+        if func is T.__setitem__ and len(args) >= 3 and isinstance(args[2], LazySlice) and not isinstance(args[0], LazySlice):
+            dst, idx = args[0], args[1]
+
+            def _set(real):
+                dst[idx] = real
+                return None
+
+            args[2]._consume(_set)
+            return None
+        if func in _meta_funcs():
+            with torch._C.DisableTorchFunctionSubclass():
+                return func(*args, **kwargs)
+        # any other op: materialise every LazySlice argument
+        def unwrap(x):
+            return x._real() if isinstance(x, LazySlice) else x
+
+        new_args = tuple(unwrap(a) if not isinstance(a, (list, tuple)) else type(a)(unwrap(b) for b in a) for a in args)
+        new_kwargs = {k: unwrap(v) for k, v in kwargs.items()}
+        with torch._C.DisableTorchFunctionSubclass():
+            return func(*new_args, **new_kwargs)
+
+    def __repr__(self):
+        return f"LazySlice({self._name}, shape={tuple(self.shape)}, dtype={self.dtype}, view={self._view})"
+
+
+# ---------------------------------------------------------------------- safetensors headers
+class _Rec:
+    __slots__ = ("name", "shape", "dtype", "start", "end", "file")
+
+    def __init__(self, name, shape, dtype, start, end, file):
+        self.name, self.shape, self.dtype, self.start, self.end, self.file = name, tuple(shape), dtype, start, end, file
+
+    @property
+    def nbytes(self):
+        return self.end - self.start
+
+
+def parse_headers(files: list[str]) -> list[_Rec]:
+    from runai_model_streamer.safetensors_streamer.safetensors_pytorch import safetensors_to_torch_dtype
+
+    recs: list[_Rec] = []
+    for fi, path in enumerate(files):
+        with open(path, "rb") as f:
+            (hlen,) = struct.unpack("<Q", f.read(8))
+            hdr = json.loads(f.read(hlen).decode("utf-8"))
+        base = 8 + hlen
+        for name, m in hdr.items():
+            if name == "__metadata__":
+                continue
+            s, e = m["data_offsets"]
+            recs.append(_Rec(name, m["shape"], safetensors_to_torch_dtype[m["dtype"]], base + s, base + e, fi))
+    return recs
+
+
+# ---------------------------------------------------------------------- range planning + streaming
+def plan_ranges(recs: list[_Rec], plan: dict[str, list | None]):
+    """For every tensor decide (abs_offset, nbytes, shape, pslice). Dim-0 single slices only."""
+    out = []
+    for r in recs:
+        v = plan.get(r.name)
+        shape = r.shape
+        if v is not None and len(shape) >= 1 and shape[0] > 0 and v[0] == 0 and 0 < v[2] < shape[0] and v[1] + v[2] <= shape[0]:
+            rowb = r.nbytes // shape[0]
+            out.append((r, r.start + v[1] * rowb, v[2] * rowb, (v[2],) + shape[1:], (0, v[1], v[2])))
+        else:
+            out.append((r, r.start, r.nbytes, shape, None))
+    return out
+
+
+class RangeReader:
+    def __init__(self, files: list[str], recs: list[_Rec], planned, device: str):
+        self.files = files
+        self.by_name = {r.name: r for r in recs}
+        self.planned = planned
+        self.device = device
+
+    def read_full(self, name: str) -> torch.Tensor:
+        r = self.by_name[name]
+        buf = torch.empty(r.nbytes, dtype=torch.uint8, pin_memory=True)
+        mv = memoryview(buf.numpy())
+        with open(self.files[r.file], "rb", buffering=0) as f:
+            f.seek(r.start)
+            got = 0
+            while got < r.nbytes:
+                n = f.readinto(mv[got:])
+                if not n:
+                    raise IOError(f"short read on {name}")
+                got += n
+        t = buf.view(r.dtype).view(r.shape) if r.nbytes else torch.empty(r.shape, dtype=r.dtype)
+        return t.to(self.device)
+
+    def stream(self, ctx: _Ctx):
+        if os.environ.get("IMPALA_RANGE_READER", "pool") == "runai":
+            yield from self.stream_runai(ctx)
+        else:
+            yield from self.stream_pool(ctx)
+
+    def stream_pool(self, ctx: _Ctx):
+        """v3 (H2): own reader — 16 preadv threads fill one of two page-locked batch buffers (IMPALA_RANGE_BATCH_BYTES, 4 GB)
+        with the planned ranges in file order while the main thread DMAs the previous batch to the GPU in ONE copy and
+        yields zero-copy GPU views per tensor (no per-tensor `.to()` sync, no per-range reader setup)."""
+        import concurrent.futures as cf
+
+        import numpy as np
+
+        ctx.reader = self
+        batch_bytes = int(os.environ.get("IMPALA_RANGE_BATCH_BYTES", str(4 * 1024**3)))
+        nthreads = int(os.environ.get("IMPALA_RANGE_THREADS", "16"))
+        plain_full = os.environ.get("IMPALA_RANGE_PLAIN_FULL", "1") == "1"
+        items = sorted(self.planned, key=lambda it: (it[0].file, it[1]))
+        ctx.n_sliced = sum(1 for it in items if it[4] is not None)
+        ctx.n_full = len(items) - ctx.n_sliced
+        total = sum(it[2] for it in items)
+        # batches: consecutive items up to batch_bytes (a single item larger than the batch gets its own oversized buffer)
+        batches: list[list] = []
+        cur: list = []
+        used = 0
+        for it in items:
+            if cur and used + it[2] > batch_bytes:
+                batches.append(cur)
+                cur, used = [], 0
+            cur.append(it)
+            used += it[2]
+        if cur:
+            batches.append(cur)
+        maxb = max(batch_bytes, max((it[2] for it in items), default=0))
+        logger.info("[impala-range] pool reader: %d tensors (%d sliced), %.1f GB in %d batches of ≤ %.1f GB, %d threads",
+                    len(items), ctx.n_sliced, total / 1e9, len(batches), maxb / 1e9, nthreads)
+        bufs = [np.empty(maxb, dtype=np.uint8) for _ in range(2)]
+        regs = [_pin_np(b) for b in bufs]
+        fds = [os.open(p, os.O_RDONLY) for p in self.files]
+        pool = cf.ThreadPoolExecutor(max_workers=nthreads)
+
+        def read_unit(unit, buf):
+            mv = memoryview(buf)
+            for fi, off, nb, boff in unit:
+                got = 0
+                while got < nb:
+                    n = os.preadv(fds[fi], [mv[boff + got: boff + nb]], off + got)
+                    if n <= 0:
+                        raise IOError(f"short read in {self.files[fi]} at {off + got}")
+                    got += n
+
+        def fill(batch, buf):
+            # lay the batch out contiguously in buf; split into ~64 MB work units for the pool
+            layout = []
+            boff = 0
+            units, unit, usize = [], [], 0
+            for r, off, nb, shape, pslice in batch:
+                layout.append(boff)
+                if nb:
+                    unit.append((r.file, off, nb, boff))
+                    usize += nb
+                    if usize >= 64 * 1024**2:
+                        units.append(unit)
+                        unit, usize = [], 0
+                boff += nb
+            if unit:
+                units.append(unit)
+            futs = [pool.submit(read_unit, u, buf) for u in units]
+            return layout, boff, futs
+
+        try:
+            pending = fill(batches[0], bufs[0]) if batches else None
+            for bi, batch in enumerate(batches):
+                layout, nbytes, futs = pending
+                for f in futs:
+                    f.result()
+                buf = bufs[bi % 2]
+                gpu = torch.from_numpy(buf[:nbytes]).to(self.device) if nbytes else None   # one DMA per batch
+                # start filling the other buffer while this batch is consumed
+                pending = fill(batches[bi + 1], bufs[(bi + 1) % 2]) if bi + 1 < len(batches) else None
+                for (r, off, nb, shape, pslice), boff in zip(batch, layout):
+                    if nb == 0:
+                        t = torch.empty(shape, dtype=r.dtype, device=self.device)
+                    else:
+                        t = gpu[boff: boff + nb].view(r.dtype).view(shape)
+                    if pslice is None:
+                        yield r.name, (t if plain_full else LazySlice(shape, r.dtype, r.name, ctx, t, None, None))
+                    else:
+                        yield r.name, _sliced_lazy(r, shape, pslice, t, ctx)
+                gpu = None
+        finally:
+            pool.shutdown(wait=True)
+            for fd in fds:
+                os.close(fd)
+            for reg in regs:
+                if reg is not None:
+                    torch.cuda.cudart().cudaHostUnregister(reg)
+
+    def stream_runai(self, ctx: _Ctx):
+        """v1 (H1): the planned ranges as Run:ai FileChunks (one reader-side group per isolated range — measured too slow)."""
+        from runai_model_streamer.file_streamer import FileChunks, FileStreamer
+        from vllm.model_executor.model_loader.weight_utils import _impala_pin_streamer_buffer
+
+        ctx.reader = self
+        os.environ.setdefault("RUNAI_STREAMER_MEMORY_LIMIT", os.environ.get("IMPALA_PINNED_BUFFER_BYTES", "16000000000"))
+        # group by file, sort by offset, merge consecutive ranges into one FileChunks
+        chunks_list: list[FileChunks] = []
+        meta: dict[tuple[int, int], tuple] = {}
+        total_bytes = 0
+        per_file: dict[int, list] = {}
+        for item in self.planned:
+            per_file.setdefault(item[0].file, []).append(item)
+        cid = 0
+        for fi, items in sorted(per_file.items()):
+            items.sort(key=lambda it: it[1])
+            cur = None
+            for r, off, nb, shape, pslice in items:
+                total_bytes += nb
+                if nb == 0:
+                    meta[(-1, len(meta))] = (r, shape, pslice)  # zero-size: yielded without reading
+                    continue
+                if cur is not None and cur.offset + sum(cur.chunks) == off and len(cur.chunks) < 4096:
+                    cur.chunks.append(nb)
+                else:
+                    cur = FileChunks(cid, self.files[fi], off, [nb])
+                    chunks_list.append(cur)
+                    cid += 1
+                meta[(cur.id, len(cur.chunks) - 1)] = (r, shape, pslice)
+        logger.info("[impala-range] rank plan: %d tensors, %d sliced, %.1f GB to read in %d range groups",
+                    len(self.planned), sum(1 for it in self.planned if it[4] is not None), total_bytes / 1e9, len(chunks_list))
+        ctx.n_sliced = sum(1 for it in self.planned if it[4] is not None)
+        ctx.n_full = len(self.planned) - ctx.n_sliced
+        for key, (r, shape, pslice) in list(meta.items()):
+            if key[0] == -1:
+                yield r.name, LazySlice(shape, r.dtype, r.name, ctx, torch.empty(shape, dtype=r.dtype, device=self.device), None, None)
+        fs = FileStreamer()
+        fs.__enter__()
+        reg = None
+        try:
+            fs.stream_files(chunks_list, credentials=None, device="cpu")
+            reg = _impala_pin_streamer_buffer(_FSAdapter(fs))
+            plain_full = os.environ.get("IMPALA_RANGE_PLAIN_FULL", "1") == "1"   # v2 (H2): no wrapper on whole-read tensors
+            for file_id, chunk_idx, buf in fs.get_chunks():
+                r, shape, pslice = meta[(file_id, chunk_idx)]
+                t = buf.view(-1).view(r.dtype).view(shape).to(self.device)
+                if pslice is None:
+                    yield r.name, (t if plain_full else LazySlice(shape, r.dtype, r.name, ctx, t, None, None))
+                else:
+                    yield r.name, _sliced_lazy(r, shape, pslice, t, ctx)
+        finally:
+            if reg is not None:
+                torch.cuda.cudart().cudaHostUnregister(reg)
+            fs.__exit__(None, None, None)
+
+
+def _sliced_lazy(r, shape, pslice, t, ctx):
+    # the placeholder advertises the ORIGINAL shape so the loader's narrow arithmetic is unchanged
+    ls = LazySlice(r.shape, r.dtype, r.name, ctx, t, pslice, None)
+    return ls
+
+
+def _pin_np(arr) -> int | None:
+    """Page-lock a numpy buffer (parallel MADV_POPULATE_WRITE, then cudaHostRegister); None when CUDA is absent or it fails."""
+    import ctypes
+    import threading
+
+    if not torch.cuda.is_available():
+        return None
+    nbytes = int(arr.nbytes)
+    addr = int(arr.ctypes.data)
+    t0 = time.time()
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        page = 4096
+        start = addr & ~(page - 1)
+        end = (addr + nbytes + page - 1) & ~(page - 1)
+        nthreads = 16
+        step = (((end - start) // nthreads) + page - 1) & ~(page - 1)
+        ths = [threading.Thread(target=lambda a, b: libc.madvise(ctypes.c_void_p(a), ctypes.c_size_t(b - a), 23),
+                                args=(a, min(a + step, end))) for a in range(start, end, step)]
+        for t in ths:
+            t.start()
+        for t in ths:
+            t.join()
+        rc = torch.cuda.cudart().cudaHostRegister(addr, nbytes, 0)
+        if int(rc) != 0:
+            logger.warning("[impala-range] cudaHostRegister rc=%s; pageable batch buffer", rc)
+            return None
+        logger.info("[impala-range] batch buffer %.1f GB page-locked in %.2f s", nbytes / 1e9, time.time() - t0)
+        return addr
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[impala-range] pinning failed (%s); pageable batch buffer", e)
+        return None
+
+
+class _FSAdapter:
+    """Shape adapter so _impala_pin_streamer_buffer (written for SafetensorsStreamer) finds the FileStreamer buffer."""
+
+    def __init__(self, fs):
+        self.file_streamer = _Inner(fs)
+
+
+class _Inner:
+    def __init__(self, fs):
+        self.file_streamer = fs
+
+
+# ---------------------------------------------------------------------- probe cache
+def _cache_path(model_dir: str, tp_size: int, tp_rank: int) -> str:
+    import vllm
+
+    root = os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
+    key = hashlib.sha1(f"{os.path.abspath(model_dir)}|tp{tp_size}|{vllm.__version__}|v1".encode()).hexdigest()[:16]
+    d = os.path.join(root, "impala-range")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{key}-rank{tp_rank}.json")
+
+
+def load_weights_ranged(loader, model, model_dir: str, revision) -> bool:
+    """Entry point (called from RunaiModelStreamerLoader.load_weights when IMPALA_RANGE_LOADER=1). Returns False → caller
+    falls back to the stock path."""
+    from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+    from vllm.platforms import current_platform
+
+    tp = get_tensor_model_parallel_world_size()
+    if tp <= 1 or not os.path.isdir(model_dir) or not current_platform.is_cuda_alike():
+        logger.info("[impala-range] not applicable (tp=%d, local=%s); stock path", tp, os.path.isdir(model_dir))
+        return False
+    rank = get_tensor_model_parallel_rank()
+    device = f"cuda:{current_platform.current_device()}"
+    files = sorted(loader._prepare_weights(model_dir, revision))
+    t0 = time.time()
+    recs = parse_headers(files)
+    t1 = time.time()
+    cpath = _cache_path(model_dir, tp, rank)
+    plan = None
+    if os.path.exists(cpath):
+        try:
+            with open(cpath) as f:
+                j = json.load(f)
+            if j.get("n") == len(recs):
+                plan = j["plan"]
+                logger.info("[impala-range] probe plan loaded from %s (%d tensors, %d sliced)", cpath, j["n"],
+                            sum(1 for v in plan.values() if v is not None))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[impala-range] bad probe cache %s (%s); re-probing", cpath, e)
+    if plan is None:
+        ctx_p = _Ctx(probe=True)
+        tp0 = time.time()
+        model.load_weights((r.name, LazySlice(r.shape, r.dtype, r.name, ctx_p)) for r in recs)
+        plan = {r.name: ctx_p.recorded.get(r.name) for r in recs}
+        n_sl = sum(1 for v in plan.values() if v is not None and v[0] == 0)
+        tmp = f"{cpath}.{os.getpid()}.tmp"   # unique per process: several TP groups on one box probe the same (tp, rank) at once
+        with open(tmp, "w") as f:
+            json.dump({"n": len(recs), "tp": tp, "rank": rank, "plan": plan}, f)
+        try:
+            os.replace(tmp, cpath)
+        except OSError as e:  # a sibling won the race; its plan is equivalent
+            logger.warning("[impala-range] probe cache publish skipped (%s)", e)
+        logger.info("[impala-range] probe pass: %d tensors, %d with a dim-0 slice, %.1f s -> %s",
+                    len(recs), n_sl, time.time() - tp0, cpath)
+    if os.environ.get("IMPALA_RANGE_PROBE_ONLY", "0") == "1":
+        logger.info("[impala-range] probe-only mode: stock full read follows")
+        return False
+    if os.environ.get("IMPALA_RANGE_NO_SLICE", "0") == "1":
+        logger.info("[impala-range] IMPALA_RANGE_NO_SLICE=1: every tensor read whole through the batched reader (A/B arm)")
+        plan = {}
+    planned = plan_ranges(recs, plan)
+    ctx = _Ctx(probe=False, plan=plan)
+    reader = RangeReader(files, recs, planned, device)
+    ts = time.time()
+    model.load_weights(reader.stream(ctx))
+    torch.cuda.synchronize()
+    logger.info("[impala-range] rank %d: headers %.1f s, stream+load %.1f s; sliced %d, full %d, on-demand full fallbacks %d "
+                "(%.2f GB)%s", rank, t1 - t0, time.time() - ts, ctx.n_sliced, ctx.n_full, ctx.n_full_fallback,
+                ctx.fallback_bytes / 1e9, (" e.g. " + ", ".join(ctx.fallback_names[:5])) if ctx.fallback_names else "")
+    return True

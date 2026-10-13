@@ -1,0 +1,52 @@
+From 6ffa0e2ac6aaca5ffe47bb6ea6dbcf88f4cac590 Mon Sep 17 00:00:00 2001
+From: Tom <tom@getimpala.ai>
+Date: Sat, 10 Oct 2026 16:11:49 +0000
+Subject: [PATCH 5/6] restore: premap-hugepage: keep the target's 2 MiB phase
+ so mremap keeps huge PMDs
+
+Aligning the premapped VMA to a 2 MiB boundary is not enough: the PIE
+restorer moves it to vma->e->start with mremap(), and move_page_tables()
+only moves a huge PMD when old and new addresses are PMD-aligned at the
+same point; otherwise it splits the PMD back to base pages. Measured on
+an 8xB300 vLLM TP=2 image: the restore task held 237.8 GB of a 239.9 GB
+worker in THP during population, and 143 MB after the mremap. Place the
+premapped VMA at an address congruent to its target modulo 2 MiB instead;
+the bump stays below one huge page so the existing reserve slack covers it.
+
+Assisted-by: Claude:claude-fable-5.1
+---
+ criu/mem.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/criu/mem.c b/criu/mem.c
+index 3d383d4e9..1da37a573 100644
+--- a/criu/mem.c
++++ b/criu/mem.c
+@@ -981,8 +981,22 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void
+ 		if (opts.premap_hugepage && size >= PREMAP_HPAGE_SIZE &&
+ 		    !(vma->e->flags & MAP_HUGETLB) && !vma_area_is(vma, VMA_FILE_PRIVATE) &&
+ 		    !(vma->e->prot == PROT_NONE && vma_area_is(vma, VMA_AREA_NOT_ACCOUNTABLE))) {
+-			*tgt_addr = (void *)(((unsigned long)*tgt_addr + PREMAP_HPAGE_SIZE - 1) &
+-					     ~(PREMAP_HPAGE_SIZE - 1));
++			/*
++			 * Keep the target's 2 MiB phase, not a bare 2 MiB
++			 * alignment: the PIE restorer mremap()s the premapped
++			 * VMA to vma->e->start, and the kernel only moves a
++			 * huge PMD intact when the old and new addresses are
++			 * both PMD-aligned at that point. With equal phase the
++			 * whole aligned interior survives the move; with a
++			 * mismatch every PMD is split back to base pages.
++			 */
++			unsigned long phase = vma->e->start & (PREMAP_HPAGE_SIZE - 1);
++			unsigned long cur = (unsigned long)*tgt_addr;
++			unsigned long cand = (cur & ~(PREMAP_HPAGE_SIZE - 1)) + phase;
++
++			if (cand < cur)
++				cand += PREMAP_HPAGE_SIZE;
++			*tgt_addr = (void *)cand;
+ 			want_thp = true;
+ 		}
+ 
+-- 
+2.43.0
+

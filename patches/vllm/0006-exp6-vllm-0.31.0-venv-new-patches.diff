@@ -1,0 +1,823 @@
+diff --color -ruN exp6-orig/vllm/__init__.py exp6-dry/lib/python3.12/site-packages/vllm/__init__.py
+--- exp6-orig/vllm/__init__.py	2026-10-11 23:46:19.731556955 +0000
++++ exp6-dry/lib/python3.12/site-packages/vllm/__init__.py	2026-10-11 20:39:42.359995346 +0000
+@@ -1,3 +1,6 @@
++import os as _impala_os
++if _impala_os.environ.get("IMPALA_CKPT_JOB_FILE") and not _impala_os.environ.get("CUDA_CHECKPOINT_JOB_FILE"):
++    _impala_os.environ["CUDA_CHECKPOINT_JOB_FILE"] = _impala_os.environ["IMPALA_CKPT_JOB_FILE"]
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """vLLM: a high-throughput and memory-efficient inference engine for LLMs."""
+diff --color -ruN exp6-orig/vllm/model_executor/layers/quantization/modelopt.py exp6-dry/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/modelopt.py
+--- exp6-orig/vllm/model_executor/layers/quantization/modelopt.py	2026-10-11 23:46:20.586087951 +0000
++++ exp6-dry/lib/python3.12/site-packages/vllm/model_executor/layers/quantization/modelopt.py	2026-10-11 21:59:05.992326498 +0000
+@@ -816,6 +816,66 @@
+         )
+ 
+ 
++def _impala_reload_fix_enabled() -> bool:
++    """Experiment 5/6 (Impala): IMPALA_RELOAD_FIX=1 enables the in-place reload fixes."""
++    import os as _os
++
++    return _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1"
++
++
++def _impala_overlap_copy_(dst: torch.Tensor, src: torch.Tensor) -> None:
++    """copy_ that tolerates an expanded (stride-0) destination: write its unique storage elements once."""
++    if torch._debug_has_internal_overlap(dst) == 0:
++        dst.copy_(src)
++        return
++    n = dst.untyped_storage().nbytes() // dst.element_size()
++    dst_flat = torch.as_strided(dst, (n,), (1,), 0)
++    if src.shape == dst.shape and src.stride() == dst.stride() and src.untyped_storage().nbytes() == dst.untyped_storage().nbytes():
++        src_flat = torch.as_strided(src, (n,), (1,), 0)
++    else:
++        idx = tuple(0 if st == 0 else slice(None) for st in dst.stride())
++        src_flat = src[idx].contiguous().reshape(-1)
++        if src_flat.numel() != n:
++            raise RuntimeError(f"overlap copy: dst storage {n} elements, src sub-view {src_flat.numel()}")
++        if not torch.equal(src, src[idx].expand_as(src)):
++            raise RuntimeError("overlap copy: source is not uniform along the destination's stride-0 dims")
++    dst_flat.copy_(src_flat)
++
++
++def _impala_refresh_quant_config_inplace(old_qc, new_qc, layer: torch.nn.Module) -> None:
++    """Experiment 5/6 (Impala): copy every tensor of the freshly built fused-MoE quant config into the tensor the LIVE quant
++    config references (same object the captured kernels read). Parameters of the layer are refreshed again by the
++    layerwise machinery afterwards (harmless). A shape/dtype mismatch rebinds the field and warns (graphs would be stale)."""
++    n_copied = n_same = n_rebound = 0
++    for desc_name in ("_a1", "_a2", "_w1", "_w2"):
++        od = getattr(old_qc, desc_name, None)
++        nd = getattr(new_qc, desc_name, None)
++        if od is None or nd is None:
++            continue
++        for field in list(vars(od).keys()):
++            ov = getattr(od, field, None)
++            nv = getattr(nd, field, None)
++            if not (isinstance(ov, torch.Tensor) and isinstance(nv, torch.Tensor)):
++                continue
++            if ov is nv:
++                n_same += 1
++                continue
++            if ov.shape == nv.shape and ov.dtype == nv.dtype and ov.device == nv.device:
++                _impala_overlap_copy_(ov, nv)
++                n_copied += 1
++            else:
++                logger.warning(
++                    "[impala-reload] %s.%s: shape/dtype changed on reload (%s/%s -> %s/%s); rebinding (captured graphs stale)",
++                    desc_name, field, tuple(ov.shape), ov.dtype, tuple(nv.shape), nv.dtype,
++                )
++                object.__setattr__(od, field, nv)
++                n_rebound += 1
++    logger.info_once(
++        "[impala-reload] fused-MoE quant config refreshed in place: %d tensors copied, %d shared, %d rebound",
++        n_copied, n_same, n_rebound,
++    )
++
++
+ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+     """MoE Method for FP4 Quantization.
+ 
+@@ -1029,16 +1089,32 @@
+ 
+     def _build_moe_kernel(self, layer: RoutedExperts) -> None:
+         """Build the modular MoE kernel from the (already in-format) weights."""
+-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
++        _impala_old_kernel = getattr(self, "moe_kernel", None)
++        _impala_old_qc = getattr(self, "moe_quant_config", None)
++        new_quant_config = self.get_fused_moe_quant_config(layer)
+         assert self.experts_cls is not None
+-        self.moe_kernel = make_nvfp4_moe_kernel(
+-            moe_quant_config=self.moe_quant_config,
++        new_kernel = make_nvfp4_moe_kernel(
++            moe_quant_config=new_quant_config,
+             moe_config=self.moe,
+             experts_cls=self.experts_cls,
+             backend=self.nvfp4_backend,
+             routing_tables=layer._expert_routing_tables(),
+         )
+-        self.moe_kernel.fused_experts.process_weights_after_loading(layer)
++        new_kernel.fused_experts.process_weights_after_loading(layer)
++        if (
++            _impala_reload_fix_enabled()
++            and _impala_old_kernel is not None
++            and _impala_old_qc is not None
++        ):
++            # Experiment 5/6 (Impala): a RELOAD. Keep the kernel the CUDA graphs were captured with and refresh its
++            # quant-config tensors in place (a1/a2_gscale are not layer parameters; the generic layerwise copy
++            # only covers parameters/buffers). The layer's parameters are copied back into their original
++            # storage by _copy_and_restore_kernel_tensors right after this returns.
++            _impala_refresh_quant_config_inplace(_impala_old_qc, new_quant_config, layer)
++            del new_kernel
++        else:
++            self.moe_quant_config = new_quant_config
++            self.moe_kernel = new_kernel
+ 
+     def _restore_padded_moe_dims(self, layer: RoutedExperts) -> None:
+         """Recover the padded ``moe_config`` dims from the exported weights."""
+diff --color -ruN exp6-orig/vllm/model_executor/model_loader/base_loader.py exp6-dry/lib/python3.12/site-packages/vllm/model_executor/model_loader/base_loader.py
+--- exp6-orig/vllm/model_executor/model_loader/base_loader.py	2026-10-11 23:46:20.776199237 +0000
++++ exp6-dry/lib/python3.12/site-packages/vllm/model_executor/model_loader/base_loader.py	2026-10-11 21:59:05.996076513 +0000
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from abc import ABC, abstractmethod
+ 
++import contextlib
+ import torch
+ import torch.nn as nn
+ 
+@@ -72,7 +73,8 @@
+                 )
+ 
+             logger.debug("Loading weights on %s ...", load_device)
+-            self.load_weights(model, model_config)
++            with _impala_count_first_load(model):
++                self.load_weights(model, model_config)
+ 
+             # Log peak GPU memory after loading weights. This is needed
+             # to have test coverage on peak memory for online quantization.
+@@ -90,6 +92,8 @@
+ 
+             process_weights_after_loading(model, model_config, target_device)
+ 
++            _impala_weight_checksum(model)
++
+         return model.eval()
+ 
+ 
+@@ -132,3 +136,200 @@
+             return True
+ 
+     return False
++
++
++_IMPALA_CHECKSUM_VERSION = 2
++
++
++def _impala_h64(t: torch.Tensor) -> tuple[str, int]:
++    """64-bit position-mixed hash of a CUDA tensor's bytes (device side), plus its byte count."""
++    mask = (1 << 64) - 1
++    chunk = 1 << 26
++    u8 = t.detach().contiguous().view(-1).view(torch.uint8)
++    nb = u8.numel()
++    pad = (-nb) % 8
++    if pad:
++        u8 = torch.cat([u8, torch.zeros(pad, dtype=torch.uint8, device=u8.device)])
++    x = u8.view(torch.int64)
++    h = 0
++    for off in range(0, x.numel(), chunk):
++        c = x[off : off + chunk]
++        idx = torch.arange(off, off + c.numel(), device=c.device, dtype=torch.int64)
++        h = (h + int(((c * 0x5BD1E995) ^ (idx * 0x1B873593)).sum().item())) & mask
++    return f"{h:016x}", nb
++
++
++def _impala_derived_tensors(model: nn.Module) -> list[tuple[str, torch.Tensor]]:
++    """Derived (non-parameter, non-buffer) CUDA tensors reachable from the modules: plain tensor attributes, fused-MoE quant
++    config descriptors, and the experts objects' tensor attributes. These are what captured CUDA graphs read besides params."""
++    out: list[tuple[str, torch.Tensor]] = []
++    seen: set[int] = set()
++
++    def add(name: str, t) -> None:
++        if isinstance(t, torch.Tensor) and t.device.type == "cuda" and t.numel() > 0 and id(t) not in seen:
++            seen.add(id(t))
++            out.append((name, t))
++
++    for mod_name, mod in model.named_modules():
++        pb = set(mod._parameters.keys()) | set(mod._buffers.keys())
++        for k, v in list(vars(mod).items()):
++            if k in pb or k == "kv_cache":  # kv_cache: the attention layers' KV tensors (bound after load), not weights
++                continue
++            add(f"{mod_name}.<attr>{k}", v)
++        qm = getattr(mod, "quant_method", None)
++        qc = getattr(qm, "moe_quant_config", None)
++        if qc is not None:
++            for desc_name in ("_a1", "_a2", "_w1", "_w2"):
++                d = getattr(qc, desc_name, None)
++                if d is None:
++                    continue
++                for f, v in list(vars(d).items()):
++                    add(f"{mod_name}.<qc>{desc_name}.{f}", v)
++        kern = getattr(qm, "moe_kernel", None)
++        ex = getattr(kern, "fused_experts", None)
++        if ex is not None:
++            for f, v in list(vars(ex).items()):
++                add(f"{mod_name}.<experts>{f}", v)
++    out.sort(key=lambda kv: kv[0])
++    return out
++
++
++def _impala_weight_checksum(model: nn.Module, tag: str = "load") -> str | None:
++    """Experiment 4/5/6 (Impala): IMPALA_WEIGHT_CHECKSUM=<dir> -> write a per-rank report hashing every GPU parameter/buffer
++    (digest `all_tensors_sha256`) and every derived CUDA tensor (digest `derived_sha256`), with data_ptr per tensor, plus
++    sha256 of a fixed sample. Returns the report path (None when the hook is inert)."""
++    import hashlib
++    import json
++    import os
++    import time
++
++    out_dir = os.environ.get("IMPALA_WEIGHT_CHECKSUM")
++    if not out_dir:
++        return None
++    from vllm.distributed import get_tensor_model_parallel_rank
++
++    t0 = time.time()
++    rank = get_tensor_model_parallel_rank()
++    items = [(n, p.data) for n, p in model.named_parameters()]
++    items += [(n, b) for n, b in model.named_buffers()]
++    items.sort(key=lambda kv: kv[0])
++    res: dict[str, dict] = {}
++    total = 0
++    for name, t in items:
++        entry = {"shape": list(t.shape), "dtype": str(t.dtype), "dev": str(t.device)}
++        if t.device.type == "cuda" and t.numel() > 0:
++            h, nb = _impala_h64(t)
++            entry["nbytes"] = nb
++            entry["h64"] = h
++            entry["ptr"] = t.data_ptr()
++            total += nb
++        res[name] = entry
++    names = [n for n, t in items if t.device.type == "cuda" and t.numel() > 0]
++    k = max(1, len(names) // 20)
++    chosen = list(dict.fromkeys(names[::k][:20] + [n for n in names if "scale" in n][:6]))
++    by_name = dict(items)
++    sample = {}
++    for n in chosen:
++        t = by_name[n]
++        sample[n] = hashlib.sha256(
++            t.detach().contiguous().view(-1).view(torch.uint8).cpu().numpy().tobytes()
++        ).hexdigest()
++    digest_src = {n: {k2: v for k2, v in e.items() if k2 != "ptr"} for n, e in res.items()}
++    digest = hashlib.sha256(json.dumps(digest_src, sort_keys=True).encode()).hexdigest()
++    derived: dict[str, dict] = {}
++    dtotal = 0
++    for name, t in _impala_derived_tensors(model):
++        h, nb = _impala_h64(t)
++        derived[name] = {"shape": list(t.shape), "dtype": str(t.dtype), "nbytes": nb, "h64": h, "ptr": t.data_ptr()}
++        dtotal += nb
++    dsrc = {n: {k2: v for k2, v in e.items() if k2 != "ptr"} for n, e in derived.items()}
++    ddigest = hashlib.sha256(json.dumps(dsrc, sort_keys=True).encode()).hexdigest()
++    report = {
++        "version": _IMPALA_CHECKSUM_VERSION,
++        "tag": tag,
++        "rank": rank,
++        "pid": os.getpid(),
++        "n_tensors": len(res),
++        "n_hashed": len(names),
++        "gpu_bytes": total,
++        "all_tensors_sha256": digest,
++        "n_derived": len(derived),
++        "derived_bytes": dtotal,
++        "derived_sha256": ddigest,
++        "sample_sha256": sample,
++        "tensors": res,
++        "derived": derived,
++        "elapsed_s": round(time.time() - t0, 1),
++        "pinned_loader": os.environ.get("IMPALA_PINNED_LOADER", "0"),
++        "reload_fix": os.environ.get("IMPALA_RELOAD_FIX", "0"),
++    }
++    os.makedirs(out_dir, exist_ok=True)
++    suffix = "" if tag == "load" else f"-{tag}"
++    path = os.path.join(out_dir, f"wchk-rank{rank}-{os.getpid()}{suffix}.json")
++    with open(path + ".tmp", "w") as f:
++        json.dump(report, f, indent=0)
++    os.replace(path + ".tmp", path)
++    logger.info(
++        "[impala-checksum] v2 tag=%s rank %d: %d tensors / %.1f GiB hashed, all-tensors %s, derived %d / %.1f MiB %s (%.1f s) -> %s",
++        tag, rank, len(names), total / 1024**3, digest[:16], len(derived), dtotal / 1024**2, ddigest[:16],
++        time.time() - t0, path,
++    )
++    return path
++
++
++@contextlib.contextmanager
++def _impala_count_first_load(model: nn.Module):
++    """Experiment 5/6 (Impala): count every layer's loaded elements during the first load (IMPALA_RELOAD_FIX=1) and store the
++    measured total as layer._impala_first_load_numel, the exact trigger total for a later layerwise reload."""
++    import os as _os
++
++    if _os.environ.get("IMPALA_RELOAD_FIX", "0") != "1":
++        yield
++        return
++    import inspect
++
++    from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS, get_numel_loaded
++    from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
++    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
++
++    counts: dict[int, int] = {}
++    wrapped: list[tuple[torch.Tensor, object]] = []
++
++    def make(layer, tensor):
++        original = getattr(tensor, "weight_loader", default_weight_loader)
++        sig = inspect.signature(original)
++
++        def counting_loader(*args, **kwargs):
++            bound = sig.bind(*args, **kwargs)
++            bound.apply_defaults()
++            n, ret = get_numel_loaded(original, bound)
++            counts[id(layer)] = counts.get(id(layer), 0) + n
++            return ret
++
++        return original, counting_loader
++
++    layers = list(model.modules())
++    for layer in layers:
++        for name, tensor in get_layer_tensors(layer).items():
++            if name in SKIP_TENSORS:
++                continue
++            original, cl = make(layer, tensor)
++            tensor.weight_loader = cl
++            wrapped.append((tensor, original))
++    try:
++        yield
++    finally:
++        for tensor, original in wrapped:
++            try:
++                if original is default_weight_loader and "weight_loader" not in tensor.__dict__:
++                    continue
++                tensor.weight_loader = original
++            except Exception:  # noqa: BLE001
++                pass
++        n_layers = 0
++        for layer in layers:
++            c = counts.get(id(layer), 0)
++            if c > 0:
++                layer._impala_first_load_numel = c
++                n_layers += 1
++        logger.info("[impala-reload] first-load totals recorded for %d layers", n_layers)
+diff --color -ruN exp6-orig/vllm/model_executor/model_loader/reload/layerwise.py exp6-dry/lib/python3.12/site-packages/vllm/model_executor/model_loader/reload/layerwise.py
+--- exp6-orig/vllm/model_executor/model_loader/reload/layerwise.py	2026-10-11 23:46:20.780526132 +0000
++++ exp6-dry/lib/python3.12/site-packages/vllm/model_executor/model_loader/reload/layerwise.py	2026-10-11 22:01:19.682882609 +0000
+@@ -53,6 +53,36 @@
+ LOADING_LAYERS: WeakSet[torch.nn.Module] = WeakSet()
+ 
+ 
++_IMPALA_PENDING: dict[int, tuple[torch.nn.Module, LayerReloadingInfo]] = {}
++
++
++def _impala_reload_fix_enabled() -> bool:
++    import os as _os
++
++    return _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1"
++
++
++def _impala_flush_pending(except_info) -> None:
++    """Experiment 5/6 (Impala): process every ready layer except the one currently receiving loads."""
++    for key in list(_IMPALA_PENDING.keys()):
++        layer, info = _IMPALA_PENDING[key]
++        if info is except_info:
++            continue
++        del _IMPALA_PENDING[key]
++        if info.can_load():
++            _layerwise_process(layer, info)
++            LOADING_LAYERS.discard(layer)
++
++
++def _impala_layer_total(layer: torch.nn.Module) -> int:
++    """Experiment 5/6 (Impala): the exact trigger total measured at the first load (base_loader._impala_count_first_load)
++    under IMPALA_RELOAD_FIX=1; the stock parameter numel otherwise."""
++    _measured = getattr(layer, "_impala_first_load_numel", None)
++    if _impala_reload_fix_enabled() and _measured:
++        return _measured
++    return get_layer_size(layer)
++
++
+ def get_layerwise_info(layer: torch.nn.Module) -> LayerReloadingInfo:
+     """Get information related to restoring and layerwise processing. If no previous
+     information existed, a new entry is constructed
+@@ -129,7 +159,7 @@
+ 
+     # Track loading progress to determine when to process/copy
+     info.load_numel = 0
+-    info.load_numel_total = get_layer_size(layer)
++    info.load_numel_total = _impala_layer_total(layer)
+     _wrap_parameters_weight_loader(layer)
+ 
+ 
+@@ -173,7 +203,7 @@
+         # Re-run on each load: layers may register parameters later (e.g., `bias`).
+         # Wrap late parameters and refresh `load_numel_total` so processing waits
+         # until all parameters are loaded.
+-        info.load_numel_total = get_layer_size(layer)
++        info.load_numel_total = _impala_layer_total(layer)
+         _wrap_parameters_weight_loader(layer)
+ 
+         # Bind and normalize arguments
+@@ -213,6 +243,13 @@
+                 )
+ 
+         # Process and copy when all weights are loaded
++        if _impala_reload_fix_enabled():
++            # Experiment 5/6 (Impala): defer processing of a ready layer until a load for another layer arrives, so a
++            # count overshoot cannot drop this layer's late loads (see _IMPALA_PENDING).
++            _impala_flush_pending(except_info=info)
++            if info.load_numel >= info.load_numel_total:  # type: ignore[operator]
++                _IMPALA_PENDING[id(info)] = (layer, info)
++            return ret
+         if info.load_numel >= info.load_numel_total:  # type: ignore[operator]
+             _layerwise_process(layer, info)
+             LOADING_LAYERS.discard(layer)
+@@ -238,6 +275,8 @@
+     if hasattr(model, "_original_do_torchao_reload"):
+         model._do_torchao_reload = model._original_do_torchao_reload
+ 
++    _impala_flush_pending(except_info=None)
++
+     deferred_attn: list[tuple[torch.nn.Module, LayerReloadingInfo]] = []
+ 
+     for layer in model.modules():
+@@ -393,17 +432,36 @@
+     non_persistent = info.kernel_non_persistent_buffers
+     loaded_tensor_names = {name for name, _ in info.loaded_weights}
+     for name, param in parameters.items():
+-        param.data.copy_(getattr(layer, name))
++        _impala_overlap_copy(param.data, getattr(layer, name), name)
+     for name, buffer in buffers.items():
+         if name not in layer._buffers:
+             continue
+         if name in non_persistent and name not in loaded_tensor_names:
+             continue
+-        buffer.data.copy_(getattr(layer, name))
++        _impala_overlap_copy(buffer.data, getattr(layer, name), name)
+ 
+     _place_kernel_tensors(layer, info)
+ 
+ 
++def _impala_overlap_copy(dst: torch.Tensor, src: torch.Tensor, name: str = "") -> None:
++    """copy_ that tolerates an expanded (stride-0) destination: write its unique storage elements once (Experiment 2/5/6)."""
++    if torch._debug_has_internal_overlap(dst) == 0:
++        dst.copy_(src)
++        return
++    n = dst.untyped_storage().nbytes() // dst.element_size()
++    dst_flat = torch.as_strided(dst, (n,), (1,), 0)
++    if src.shape == dst.shape and src.stride() == dst.stride() and src.untyped_storage().nbytes() == dst.untyped_storage().nbytes():
++        src_flat = torch.as_strided(src, (n,), (1,), 0)
++    else:
++        idx = tuple(0 if st == 0 else slice(None) for st in dst.stride())
++        src_flat = src[idx].contiguous().reshape(-1)
++        if src_flat.numel() != n:
++            raise RuntimeError(f"overlap copy for {name}: dst storage {n} elements, src sub-view {src_flat.numel()}")
++        if not torch.equal(src, src[idx].expand_as(src)):
++            raise RuntimeError(f"overlap copy for {name}: source is not uniform along the destination's stride-0 dims")
++    dst_flat.copy_(src_flat)
++
++
+ def _place_kernel_tensors(layer: torch.nn.Module, info: LayerReloadingInfo):
+     for name in get_layer_tensors(layer):
+         delattr(layer, name)
+diff --color -ruN exp6-orig/vllm/model_executor/model_loader/runai_streamer_loader.py exp6-dry/lib/python3.12/site-packages/vllm/model_executor/model_loader/runai_streamer_loader.py
+--- exp6-orig/vllm/model_executor/model_loader/runai_streamer_loader.py	2026-10-11 23:46:20.783708523 +0000
++++ exp6-dry/lib/python3.12/site-packages/vllm/model_executor/model_loader/runai_streamer_loader.py	2026-10-11 22:01:19.683679128 +0000
+@@ -134,6 +134,15 @@
+         """Download model if necessary."""
+         self._prepare_weights(model_config.model, model_config.revision)
+ 
++    def get_all_weights(
++        self, model_config: ModelConfig, model: nn.Module
++    ) -> Generator[tuple[str, torch.Tensor], None, None]:
++        """Experiment 5/6 (Impala): the iterator `reload_weights` needs, same source and path as the first load."""
++        model_weights = model_config.model
++        if model_weights_override := model_config.model_weights:
++            model_weights = model_weights_override
++        yield from self._get_weights_iterator(model_weights, model_config.revision)
++
+     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+         """Load weights into a model."""
+         model_weights = model_config.model
+diff --color -ruN exp6-orig/vllm/model_executor/warmup/kernel_warmup.py exp6-dry/lib/python3.12/site-packages/vllm/model_executor/warmup/kernel_warmup.py
+--- exp6-orig/vllm/model_executor/warmup/kernel_warmup.py	2026-10-11 23:46:21.020733960 +0000
++++ exp6-dry/lib/python3.12/site-packages/vllm/model_executor/warmup/kernel_warmup.py	2026-10-11 21:23:24.028821103 +0000
+@@ -5,8 +5,11 @@
+ happen during model execution.
+ """
+ 
++import json
++import os
+ import sys
+ import time
++from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+ import torch
+@@ -18,7 +21,6 @@
+ from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
+ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
+     resolve_flashinfer_autotune_file,
+-    write_flashinfer_autotune_cache,
+ )
+ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
+     autotune_hisparse_flashinfer_attention,
+@@ -220,6 +222,13 @@
+     if process_local_only:
+         return
+ 
++    if current_platform.is_rocm():
++        from vllm.model_executor.warmup.rocm_segmented_attn_autotune_warmup import (
++            rocm_segmented_attn_autotune_warmup,
++        )
++
++        rocm_segmented_attn_autotune_warmup(worker)
++
+     flashinfer_sparse_mla_decode_autotune_warmup(worker)
+     deepseek_v4_sparse_mla_attention_warmup(worker)
+ 
+@@ -348,6 +357,9 @@
+     return tuple(dict.fromkeys(token_counts))
+ 
+ 
++_IMPALA_TUNE_MODE = True  # Impala: set by flashinfer_autotune() when the persisted cache is trusted
++
++
+ def _run_flashinfer_autotune_dummy_runs(
+     runner: "GPUModelRunner", *, skip_attn: bool = False
+ ) -> None:
+@@ -361,7 +373,7 @@
+             num_tokens,
+             tuning_buckets,
+         )
+-        with fi_utils.autotune(tuning_buckets=tuning_buckets):
++        with fi_utils.autotune(tune_mode=_IMPALA_TUNE_MODE, tuning_buckets=tuning_buckets):
+             runner._dummy_run(
+                 num_tokens=num_tokens,
+                 skip_eplb=True,
+@@ -401,6 +413,26 @@
+         )
+ 
+ 
++def _autotune_cache_fingerprint(path: Path) -> tuple[str, int] | None:
++    """Identify a saved autotune file by its FlashInfer metadata and size."""
++    try:
++        configs = json.loads(path.read_text())
++        metadata = configs.pop("_metadata", None)
++    except (OSError, ValueError, AttributeError):
++        return None
++    return json.dumps(metadata, sort_keys=True), len(configs)
++
++
++def _all_ranks_have_matching_cache(path: Path, group) -> bool:
++    """True iff every rank in ``group`` has its own, mutually consistent file."""
++    fingerprint = _autotune_cache_fingerprint(path)
++    if group.world_size == 1:
++        return fingerprint is not None
++    gathered: list[tuple[str, int] | None] = [None] * group.world_size
++    torch.distributed.all_gather_object(gathered, fingerprint, group=group.cpu_group)
++    return fingerprint is not None and all(f == fingerprint for f in gathered)
++
++
+ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
+     """Autotune FlashInfer operations.
+     FlashInfer have many implementations for the same operation,
+@@ -410,17 +442,30 @@
+     Without autotuning, FlashInfer will rely on heuristics, which may
+     be significantly slower.
+ 
+-    Every rank profiles the same tactics. When distributed, per-tactic
+-    timings are averaged over the world CPU group so all ranks select the
+-    same tactic.
++    With PP > 1, stages run different layers and may profile different ops,
++    so each stage's TP group tunes separately with its own cache file;
++    otherwise the world group tunes together. Per-tactic timings are
++    averaged over the tuning group so all its ranks select the same tactic.
++
++    Results are persisted per rank: FlashInfer keys MoE entries by tp/ep rank
++    (``MoERunner.get_cache_key_extras``), so one rank's file only hits on that
++    rank. A rank with a cache hit skips the per-tactic reduce the others block
++    in, so ranks keep loaded configs only if every rank in the tuning group
++    has a matching file and successfully loads it.
+     """
+     from flashinfer.autotuner import AutoTuner, set_autotune_process_group
+ 
+     import vllm.utils.flashinfer as fi_utils
+-    from vllm.distributed.parallel_state import get_world_group
++    from vllm.distributed.parallel_state import (
++        get_pp_group,
++        get_tp_group,
++        get_world_group,
++    )
+ 
+     world = get_world_group()
+-    is_leader = world.rank_in_group == 0
++    pp_size = get_pp_group().world_size
++    tune_group = get_tp_group() if pp_size > 1 else world
++    is_leader = tune_group.rank_in_group == 0
+     tuner = AutoTuner.get()
+ 
+     autotune_kwargs: dict = {}
+@@ -433,6 +478,11 @@
+         autotune_kwargs["skip_ops"] = skip_ops
+ 
+     cache_path = resolve_flashinfer_autotune_file(runner)
++    # The world group only spans DP ranks when vLLM folds DP into it.
++    dp_rank = runner.vllm_config.parallel_config.data_parallel_rank
++    cache_path = cache_path.with_name(
++        f"{cache_path.stem}_dp{dp_rank}_rank{world.rank_in_group}{cache_path.suffix}"
++    )
+     if is_leader:
+         logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
+ 
+@@ -441,23 +491,32 @@
+     # which lead to some EP ranks receiving no tokens and skipping their
+     # MoE kernel entirely, and cause hang due to all-reduce collective
+     # during synchronized autotuning.
+-    # Read cached autotune results and broadcast to all ranks.
+-    cached_results: bytes | None = None
+-    if is_leader and cache_path.exists():
+-        with open(cache_path, "rb") as f:
+-            cached_results = f.read()
+-    cached_results = world.broadcast_object(cached_results, src=0)
+-    if cached_results is not None:
+-        write_flashinfer_autotune_cache(cache_path, cached_results)
+-        world.barrier()
+-        tuner.load_configs(str(cache_path))
++    _impala_loaded = False
++    if _all_ranks_have_matching_cache(cache_path, tune_group):
++        loaded = tuner.load_configs(str(cache_path))
++        if tune_group.world_size > 1:
++            loaded_by_rank: list[bool | None] = [None] * tune_group.world_size
++            torch.distributed.all_gather_object(
++                loaded_by_rank, loaded, group=tune_group.cpu_group
++            )
++            loaded = all(loaded_by_rank)
++        if not loaded:
++            tuner.clear_cache()
++        _impala_loaded = bool(loaded)
++    _impala_tune = not (
++        _impala_loaded and os.environ.get("IMPALA_FI_TRUST_CACHE", "0") == "1"
++    )
++    if not _impala_tune:
++        logger.info_once("[impala-fi] every rank loaded the autotune cache; running the warmup with tune_mode=False")
++    global _IMPALA_TUNE_MODE
++    _IMPALA_TUNE_MODE = _impala_tune
+ 
+-    group = world.cpu_group if world.world_size > 1 else None
++    group = tune_group.cpu_group if tune_group.world_size > 1 else None
+     set_autotune_process_group(group)
+     try:
+         with (
+             torch.inference_mode(),
+-            fi_utils.autotune(tune_mode=True, **autotune_kwargs),
++            fi_utils.autotune(tune_mode=_impala_tune, **autotune_kwargs),
+         ):
+             hisparse_enabled = (
+                 runner.vllm_config.attention_config.hisparse_config is not None
+@@ -478,5 +537,7 @@
+ 
+     if world.world_size > 1:
+         world.barrier()
+-    if is_leader:
++    # Skip the rewrite when nothing was tuned this start (every entry came from
++    # the file). FlashInfer gates its own autotune(cache=...) save the same way.
++    if tuner._dirty:
+         tuner.save_configs(str(cache_path))
+diff --color -ruN exp6-orig/vllm/v1/executor/multiproc_executor.py exp6-dry/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py
+--- exp6-orig/vllm/v1/executor/multiproc_executor.py	2026-10-11 23:46:21.626084255 +0000
++++ exp6-dry/lib/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py	2026-10-11 20:39:42.360184203 +0000
+@@ -889,6 +889,23 @@
+         # Set net device env vars for the worker if VLLM_GPU_NIC_PCIE_MAPPING is set
+         set_worker_net_device(kwargs.get("local_rank", 0), kwargs["vllm_config"])
+ 
++        if os.environ.get("IMPALA_NUMA_RANK_BIND") == "1":
++            try:
++                import ctypes
++                _lr = kwargs.get("local_rank", kwargs.get("rank", 0))
++                _nodes = [int(x) for x in os.environ.get("IMPALA_NUMA_NODES", "").split(",") if x != ""]
++                if _lr < len(_nodes):
++                    _node = _nodes[_lr]
++                    _cpus = set()
++                    for _part in open(f"/sys/devices/system/node/node{_node}/cpulist").read().strip().split(","):
++                        _a, _, _b = _part.partition("-")
++                        _cpus.update(range(int(_a), int(_b or _a) + 1))
++                    os.sched_setaffinity(0, _cpus)
++                    _mask = ctypes.c_ulong(1 << _node)
++                    _rc = ctypes.CDLL(None, use_errno=True).syscall(238, 1, ctypes.byref(_mask), 64)  # set_mempolicy(MPOL_PREFERRED)
++                    logger.info("IMPALA numa rank bind: local_rank=%s node=%s cpus=%d mempolicy_rc=%s", _lr, _node, len(_cpus), _rc)
++            except Exception as _e:  # placement only — never fail the worker
++                logger.warning("IMPALA numa rank bind failed: %s", _e)
+         worker = None
+         ready_writer = kwargs.pop("ready_pipe")
+         death_pipe = kwargs.pop("death_pipe", None)
+diff --color -ruN exp6-orig/vllm/v1/worker/gpu_worker.py exp6-dry/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py
+--- exp6-orig/vllm/v1/worker/gpu_worker.py	2026-10-11 23:46:21.780136093 +0000
++++ exp6-dry/lib/python3.12/site-packages/vllm/v1/worker/gpu_worker.py	2026-10-11 21:59:05.995769556 +0000
+@@ -567,6 +567,44 @@
+         with set_current_vllm_config(self.vllm_config):
+             self.model_runner.reload_weights(*args, **kwargs)
+ 
++    def impala_weight_checksum(self, tag: str = "rpc") -> str:
++        """Experiment 5/6 (Impala): write the weight/derived-tensor checksum report (IMPALA_WEIGHT_CHECKSUM=<dir>) via RPC."""
++        from vllm.model_executor.model_loader.base_loader import _impala_weight_checksum
++
++        torch.cuda.synchronize()
++        return _impala_weight_checksum(self.model_runner.model, tag=str(tag)) or ""
++
++    def impala_zero_kv_cache(self) -> str:
++        """Experiment 5 (Impala, diagnostic): zero every KV cache tensor."""
++        n = 0
++        for t in getattr(self.model_runner, "kv_caches", []) or []:
++            if isinstance(t, torch.Tensor) and t.numel() > 0:
++                t.zero_()
++                n += t.numel() * t.element_size()
++        torch.cuda.synchronize()
++        return f"zeroed {n / 2**30:.1f} GiB"
++
++    def impala_memory_stats(self) -> str:
++        """Experiment 5 (Impala, diagnostic): allocator state + KV cache bytes bound (json)."""
++        import json as _json
++
++        st = torch.cuda.memory_stats()
++        free, total = torch.cuda.mem_get_info()
++        kv = sum(t.numel() * t.element_size() for t in (getattr(self.model_runner, "kv_caches", []) or []) if isinstance(t, torch.Tensor))
++        keys = ("allocated_bytes.all.current", "reserved_bytes.all.current", "inactive_split_bytes.all.current",
++                "segment.all.current", "num_alloc_retries", "num_ooms", "active_bytes.all.current")
++        out = {k: int(st.get(k, -1)) for k in keys}
++        out.update({"kv_cache_bytes": int(kv), "device_used_bytes": int(total - free)})
++        return _json.dumps(out)
++
++    def impala_empty_cache(self) -> str:
++        """Experiment 5 (Impala, diagnostic): torch.cuda.empty_cache(); returns reserved bytes before/after."""
++        before = int(torch.cuda.memory_stats().get("reserved_bytes.all.current", -1))
++        torch.cuda.synchronize()
++        torch.cuda.empty_cache()
++        after = int(torch.cuda.memory_stats().get("reserved_bytes.all.current", -1))
++        return f"reserved {before / 2**30:.1f} -> {after / 2**30:.1f} GiB"
++
+     @torch.inference_mode()
+     def determine_available_memory(self) -> int:
+         """Profiles the peak memory usage of the model to determine how much
+diff --color -ruN exp6-orig/flashinfer/gdn_kernels/gdn_decode_bf16_state.py exp6-dry/lib/python3.12/site-packages/flashinfer/gdn_kernels/gdn_decode_bf16_state.py
+--- exp6-orig/flashinfer/gdn_kernels/gdn_decode_bf16_state.py	2026-10-11 23:46:26.899065531 +0000
++++ exp6-dry/lib/python3.12/site-packages/flashinfer/gdn_kernels/gdn_decode_bf16_state.py	2026-10-11 20:59:43.026449819 +0000
+@@ -2702,12 +2702,21 @@
+ # PUBLIC API
+ # ==============================================================================
+ # Number of SMs on target GPU (detected dynamically)
+-NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
++_IMPALA_NUM_SMS = None
++def _impala_num_sms():
++    global _IMPALA_NUM_SMS
++    if _IMPALA_NUM_SMS is None:
++        _IMPALA_NUM_SMS = torch.cuda.get_device_properties(0).multi_processor_count
++    return _IMPALA_NUM_SMS
+ 
+ # GPU architecture detected once at import time — avoids per-call
+ # torch.cuda.get_device_capability() in the hot path.
+-_GPU_MAJOR, _ = torch.cuda.get_device_capability(0)
+-_USE_PACKED_FMA = _GPU_MAJOR >= 10
++_IMPALA_USE_PACKED_FMA = None
++def _impala_use_packed_fma():
++    global _IMPALA_USE_PACKED_FMA
++    if _IMPALA_USE_PACKED_FMA is None:
++        _IMPALA_USE_PACKED_FMA = torch.cuda.get_device_capability(0)[0] >= 10
++    return _IMPALA_USE_PACKED_FMA
+ 
+ 
+ def gated_delta_rule(
+@@ -2883,7 +2892,7 @@
+         num_v_tiles = V // tv
+         grid_size = B * HV * num_v_tiles
+         # Want at least 4 waves for good occupancy
+-        if grid_size >= 4 * NUM_SMS:
++        if grid_size >= 4 * _impala_num_sms():
+             return tv
+     return 32  # Minimum tile_v for maximum parallelism
+ 
+@@ -3081,7 +3090,7 @@
+         effective_disable_final = disable_state_update
+ 
+     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+-    use_packed_fma = _USE_PACKED_FMA
++    use_packed_fma = _impala_use_packed_fma()
+     # Single-pool callers either pass output_state_indices=None (defaults to
+     # initial_state_indices below) or pass the same tensor for both. In both
+     # cases the kernel can elide write-side base-pointer arithmetic via the
+@@ -3438,7 +3447,7 @@
+         effective_disable_final = disable_state_update
+ 
+     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+-    use_packed_fma = _USE_PACKED_FMA
++    use_packed_fma = _impala_use_packed_fma()
+     # Single-pool callers either pass output_state_indices=None (defaults to
+     # initial_state_indices below) or pass the same tensor for both. In both
+     # cases the kernel can elide write-side base-pointer arithmetic via the
+@@ -3807,7 +3816,7 @@
+     tile_v, ilp_rows = _get_bf16_mtp_config(B, T, HV, V)
+ 
+     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+-    use_packed_fma = _USE_PACKED_FMA
++    use_packed_fma = _impala_use_packed_fma()
+     # Set same_pool=True when reads and writes alias (single-pool); the
+     # kernel then DCEs write-side base-pointer arithmetic.
+     same_pool = (
+diff --color -ruN exp6-orig/flashinfer/kda_kernels/__init__.py exp6-dry/lib/python3.12/site-packages/flashinfer/kda_kernels/__init__.py
+--- exp6-orig/flashinfer/kda_kernels/__init__.py	2026-10-11 23:46:27.035065047 +0000
++++ exp6-dry/lib/python3.12/site-packages/flashinfer/kda_kernels/__init__.py	2026-10-11 21:01:03.649145837 +0000
+@@ -56,7 +56,7 @@
+ # only for tests and benchmarks.
+ 
+ try:
+-    if _torch.cuda.is_available():
++    if _torch.cuda.is_initialized():  # Impala: no CUDA init at import time (was is_available())
+         from ..cute_dsl.availability import is_cute_dsl_arch_supported as _dsl_arch_ok
+ 
+         if not _dsl_arch_ok(*_torch.cuda.get_device_capability(0)):

@@ -1,0 +1,234 @@
+From 802b25a6e258a5a6088426b993cbff41bb247e81 Mon Sep 17 00:00:00 2001
+From: Tom <tom@getimpala.ai>
+Date: Sun, 11 Oct 2026 10:32:09 +0000
+Subject: [PATCH 1/2] [Loader] Pinned staging for the Run:ai streamer path
+ (env-gated) + weight checksum hook
+
+Experiment 4 on an 8xB300 (Impala, 2026-10-11): the weight stage of a cold boot is bound by
+PAGEABLE host->device copies. The Run:ai streamer preads into one pageable numpy buffer and
+vLLM's weight_loaders then copy from it with param.copy_(), i.e. a driver-staged memcpy per
+tensor (~2.4 GB/s per worker with 8 workers on this box, 4.5 GB/s alone).
+
+This change page-locks the streamer's CPU buffer right after stream_files() (parallel
+MADV_POPULATE_WRITE, then cudaHostRegister; ~0.2 s/GB) and, by default, streams every tensor
+to the worker's GPU from pinned memory (device=cuda:<rank>) so the weight_loaders see GPU
+tensors and all TP narrows are device-to-device. The buffer is bounded
+(RUNAI_STREAMER_MEMORY_LIMIT defaults to 40e9 when unset) and unregistered when the iterator
+closes; any failure falls back to the stock path with a warning.
+
+Gates (all off by default): IMPALA_PINNED_LOADER=1, IMPALA_PINNED_GPU_YIELD=1,
+IMPALA_PINNED_BUFFER_BYTES (16e9 was best: pin setup 3.5 s, no stream penalty),
+IMPALA_PINNED_TOUCH_THREADS, IMPALA_PINNED_THP. IMPALA_WEIGHT_CHECKSUM=<dir> writes a per-rank
+report hashing every GPU parameter/buffer after process_weights_after_loading (used to prove
+bit-identical weights between the stock and the pinned path).
+
+Measured on GLM-5.2-NVFP4 (433 GiB, 232k tensors), vLLM 0.20.2, runai-model-streamer 0.16.1,
+4x TP=2 on 8xB300: "Model loading took" 39-42 s vs 75-79 s (-48 %), READY -32...-36 s per
+replica, checksums identical, throughput unchanged. TP=8: -2...-4 s on 47 s (that shape is
+bound by every rank reading the whole checkpoint, not by the copy path).
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../model_loader/base_loader.py               | 76 +++++++++++++++++++
+ .../model_loader/weight_utils.py              | 75 +++++++++++++++++-
+ 2 files changed, 150 insertions(+), 1 deletion(-)
+
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index fb2f77d..8e5e23f 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -79,6 +79,8 @@ class BaseModelLoader(ABC):
+ 
+             process_weights_after_loading(model, model_config, target_device)
+ 
++            _impala_weight_checksum(model)
++
+         return model.eval()
+ 
+ 
+@@ -99,3 +101,77 @@ def _has_online_quant(model: nn.Module):
+             return True
+ 
+     return False
++
++
++def _impala_weight_checksum(model: nn.Module) -> None:
++    """Experiment 4 (Impala): IMPALA_WEIGHT_CHECKSUM=<dir> -> write a per-rank report hashing every GPU parameter/buffer
++    (64-bit position-mixed sum on the device) plus sha256 of a fixed sample, after process_weights_after_loading."""
++    import hashlib
++    import json
++    import os
++    import time
++
++    out_dir = os.environ.get("IMPALA_WEIGHT_CHECKSUM")
++    if not out_dir:
++        return
++    from vllm.distributed import get_tensor_model_parallel_rank
++
++    t0 = time.time()
++    rank = get_tensor_model_parallel_rank()
++    items = [(n, p.data) for n, p in model.named_parameters()]
++    items += [(n, b) for n, b in model.named_buffers()]
++    items.sort(key=lambda kv: kv[0])
++    mask = (1 << 64) - 1
++    chunk = 1 << 26
++    res: dict[str, dict] = {}
++    total = 0
++    for name, t in items:
++        entry = {"shape": list(t.shape), "dtype": str(t.dtype), "dev": str(t.device)}
++        if t.device.type == "cuda" and t.numel() > 0:
++            u8 = t.detach().contiguous().view(-1).view(torch.uint8)
++            nb = u8.numel()
++            pad = (-nb) % 8
++            if pad:
++                u8 = torch.cat([u8, torch.zeros(pad, dtype=torch.uint8, device=u8.device)])
++            x = u8.view(torch.int64)
++            h = 0
++            for off in range(0, x.numel(), chunk):
++                c = x[off : off + chunk]
++                idx = torch.arange(off, off + c.numel(), device=c.device, dtype=torch.int64)
++                h = (h + int(((c * 0x5BD1E995) ^ (idx * 0x1B873593)).sum().item())) & mask
++            entry["nbytes"] = nb
++            entry["h64"] = f"{h:016x}"
++            total += nb
++        res[name] = entry
++    names = [n for n, t in items if t.device.type == "cuda" and t.numel() > 0]
++    k = max(1, len(names) // 20)
++    chosen = list(dict.fromkeys(names[::k][:20] + [n for n in names if "scale" in n][:6]))
++    by_name = dict(items)
++    sample = {}
++    for n in chosen:
++        t = by_name[n]
++        sample[n] = hashlib.sha256(
++            t.detach().contiguous().view(-1).view(torch.uint8).cpu().numpy().tobytes()
++        ).hexdigest()
++    digest = hashlib.sha256(json.dumps(res, sort_keys=True).encode()).hexdigest()
++    report = {
++        "rank": rank,
++        "pid": os.getpid(),
++        "n_tensors": len(res),
++        "n_hashed": len(names),
++        "gpu_bytes": total,
++        "all_tensors_sha256": digest,
++        "sample_sha256": sample,
++        "tensors": res,
++        "elapsed_s": round(time.time() - t0, 1),
++        "pinned_loader": os.environ.get("IMPALA_PINNED_LOADER", "0"),
++    }
++    os.makedirs(out_dir, exist_ok=True)
++    path = os.path.join(out_dir, f"wchk-rank{rank}-{os.getpid()}.json")
++    with open(path + ".tmp", "w") as f:
++        json.dump(report, f, indent=0)
++    os.replace(path + ".tmp", path)
++    logger.info(
++        "[impala-checksum] rank %d: %d tensors, %.1f GiB hashed, all-tensors sha256 %s (%.1f s) -> %s",
++        rank, len(names), total / 1024**3, digest[:16], time.time() - t0, path,
++    )
+diff --git a/vllm/model_executor/model_loader/weight_utils.py b/vllm/model_executor/model_loader/weight_utils.py
+index 31b00df..30b474f 100644
+--- a/vllm/model_executor/model_loader/weight_utils.py
++++ b/vllm/model_executor/model_loader/weight_utils.py
+@@ -1035,6 +1035,66 @@ def multi_thread_safetensors_weights_iterator(
+                 yield key, state_dict.pop(key)
+ 
+ 
++_IMPALA_PINNED_VERSION = 2
++
++
++def _impala_pin_streamer_buffer(streamer) -> int | None:
++    """Experiment 4 (Impala): page-lock the Run:ai streamer's CPU staging buffer so that host->device copies out of it are
++    DMA (pinned) copies. Returns the registered address (for cudaHostUnregister) or None if the stock path stays."""
++    import ctypes
++    import threading
++    import time
++
++    try:
++        buf = streamer.file_streamer.file_streamer.requests_iterator.buffer  # np.ndarray[uint8]
++    except AttributeError as e:
++        logger.warning("[impala-pinned] streamer buffer not found (%s); staying on the pageable path", e)
++        return None
++    nbytes = int(buf.nbytes)
++    if nbytes == 0:
++        return None
++    addr = int(buf.ctypes.data)
++    t0 = time.time()
++    try:
++        # populate the pages in parallel without touching their content (the streamer threads may already be writing)
++        libc = ctypes.CDLL("libc.so.6", use_errno=True)
++        page = 4096
++        madv_populate_write = 23
++        madv_hugepage = 14
++        start = addr & ~(page - 1)
++        end = (addr + nbytes + page - 1) & ~(page - 1)
++        if os.environ.get("IMPALA_PINNED_THP", "1") == "1":
++            libc.madvise(ctypes.c_void_p(start), ctypes.c_size_t(end - start), madv_hugepage)
++        nthreads = max(1, int(os.environ.get("IMPALA_PINNED_TOUCH_THREADS", "16")))
++        step = (((end - start) // nthreads) + page - 1) & ~(page - 1)
++
++        def _touch(a: int, b: int) -> None:
++            libc.madvise(ctypes.c_void_p(a), ctypes.c_size_t(b - a), madv_populate_write)
++
++        ths = [
++            threading.Thread(target=_touch, args=(a, min(a + step, end)))
++            for a in range(start, end, step)
++        ]
++        for t in ths:
++            t.start()
++        for t in ths:
++            t.join()
++        t1 = time.time()
++        rc = torch.cuda.cudart().cudaHostRegister(addr, nbytes, 0)
++        t2 = time.time()
++        if int(rc) != 0:
++            logger.warning("[impala-pinned] cudaHostRegister rc=%s; staying on the pageable path", rc)
++            return None
++        logger.info(
++            "[impala-pinned] v%d streamer buffer %.1f GB page-locked (thp=%s): populate %.2f s, register %.2f s",
++            _IMPALA_PINNED_VERSION, nbytes / 1e9, os.environ.get("IMPALA_PINNED_THP", "1"), t1 - t0, t2 - t1,
++        )
++        return addr
++    except Exception as e:  # noqa: BLE001
++        logger.warning("[impala-pinned] pinning failed (%s); staying on the pageable path", e)
++        return None
++
++
+ def runai_safetensors_weights_iterator(
+     hf_weights_files: list[str],
+     use_tqdm_on_load: bool,
+@@ -1049,11 +1109,20 @@ def runai_safetensors_weights_iterator(
+             else "cpu"
+         )
+ 
++        _impala_pinned = os.environ.get("IMPALA_PINNED_LOADER", "0") == "1"
++        if _impala_pinned:
++            os.environ.setdefault(
++                "RUNAI_STREAMER_MEMORY_LIMIT",
++                os.environ.get("IMPALA_PINNED_BUFFER_BYTES", "40000000000"),
++            )
++            if is_cuda_alike and os.environ.get("IMPALA_PINNED_GPU_YIELD", "1") == "1":
++                device = f"cuda:{current_platform.current_device()}"
+         streamer.stream_files(
+             hf_weights_files,
+             device=device,
+             is_distributed=is_distributed,
+         )
++        _impala_reg = _impala_pin_streamer_buffer(streamer) if _impala_pinned else None
+         total_tensors = sum(
+             len(tensors_meta)
+             for tensors_meta in streamer.files_to_tensors_metadata.values()
+@@ -1068,7 +1137,11 @@ def runai_safetensors_weights_iterator(
+             mininterval=2,
+         )
+ 
+-        yield from tensor_iter
++        try:
++            yield from tensor_iter
++        finally:
++            if _impala_reg is not None:
++                torch.cuda.cudart().cudaHostUnregister(_impala_reg)
+ 
+ 
+ def _init_fastsafetensors_loader(
+-- 
+2.43.0
+

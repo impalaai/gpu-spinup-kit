@@ -1,0 +1,44 @@
+From 5f152bba87d50dda3325763b9b4538d164ed1a88 Mon Sep 17 00:00:00 2001
+From: Tom <tom@getimpala.ai>
+Date: Sun, 11 Oct 2026 15:09:50 +0000
+Subject: [PATCH 4/4] [Loader] Run:ai streamer loader: get_all_weights so
+ reload_weights can use it (pinned reload)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+vLLM 0.20.2's GPUModelRunner.reload_weights raises NotImplementedError unless the configured loader
+exposes get_all_weights; the Run:ai loader lacked it although its iterator is exactly what the first
+load used. With it, a server started with --load-format runai_streamer reloads through the same path
+as its first load — on the Impala B300 box that is the page-locked 16 GB staging buffer streaming to
+the GPU at ~14 GB/s per worker (Experiment 4), so four TP=2 replicas can refill their weights after
+a level-2 sleep from ONE page-cached copy of the checkpoint.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .../model_executor/model_loader/runai_streamer_loader.py | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/vllm/model_executor/model_loader/runai_streamer_loader.py b/vllm/model_executor/model_loader/runai_streamer_loader.py
+index 44ef9df53..a255cd9ef 100644
+--- a/vllm/model_executor/model_loader/runai_streamer_loader.py
++++ b/vllm/model_executor/model_loader/runai_streamer_loader.py
+@@ -93,6 +93,15 @@ class RunaiModelStreamerLoader(BaseModelLoader):
+         """Download model if necessary"""
+         self._prepare_weights(model_config.model, model_config.revision)
+ 
++    def get_all_weights(
++        self, model_config: ModelConfig, model: nn.Module
++    ) -> Generator[tuple[str, torch.Tensor], None, None]:
++        """Experiment 5 (Impala): the iterator `reload_weights` needs, same source and path as the first load."""
++        model_weights = model_config.model
++        if model_weights_override := model_config.model_weights:
++            model_weights = model_weights_override
++        yield from self._get_weights_iterator(model_weights, model_config.revision)
++
+     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+         """Load weights into a model."""
+         model_weights = model_config.model
+-- 
+2.43.0
+

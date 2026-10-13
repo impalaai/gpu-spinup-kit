@@ -1,0 +1,36 @@
+From 4658721b7b8f0ccbfdc2395aa418f48989133b7c Mon Sep 17 00:00:00 2001
+From: Tom <tom@getimpala.ai>
+Date: Tue, 13 Oct 2026 00:15:07 +0000
+Subject: [PATCH 3/6] doc: describe --premap-threads
+
+Assisted-by: Claude:claude-fable-5.1
+---
+ Documentation/criu.txt | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/Documentation/criu.txt b/Documentation/criu.txt
+index 92c6431db..19ecf3e01 100644
+--- a/Documentation/criu.txt
++++ b/Documentation/criu.txt
+@@ -441,6 +441,18 @@ mount -t cgroup -o devices,freezer none devices,freezer
+     synchronous. The option can also be set through a configuration file
+     (*decompress-threads 0*).
+ 
++*--premap-threads* 'N'::
++    During *restore*, map the private memory areas of a task in the restore
++    task itself and populate them before the task is handed to the PIE
++    restorer, instead of reading page contents from inside the restorer.
++    With 'N' greater than 1 the page reads are drained by 'N' concurrent
++    threads, each handling an independent record of at most 256 MiB, so a
++    single large mapping is filled in parallel. This removes the single-reader
++    limit of a large process (one thread at roughly 2 GB/s) when the image
++    sits on fast storage. The default of 0 keeps the existing behaviour.
++    The option only engages for plain, uncompressed images without a parent
++    image chain; other images fall back to the usual path.
++
+ *--timeout* 'number'::
+     Set a time limit in seconds for collecting tasks during the
+     dump operation. The timeout is 10 seconds by default.
+-- 
+2.43.0
+

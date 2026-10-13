@@ -1,0 +1,777 @@
+From 66113b5f7432d39bfd88e6e9568bac4915a5d3a0 Mon Sep 17 00:00:00 2001
+From: Tom <tom@getimpala.ai>
+Date: Sun, 11 Oct 2026 15:09:22 +0000
+Subject: [PATCH 3/4] [Reload] Keep captured-graph tensors valid across
+ reload_weights after a level-2 sleep (NVFP4 MoE + MLA)
+
+Experiment 5 on an 8xB300 (Impala, 2026-10-11), GLM-5.2-NVFP4 (ModelOpt NVFP4 MoE on the FlashInfer
+TRTLLM backend + MLA), vLLM 0.20.2. Sleep level 2 discards every allocation of the "weights" memory
+pool. `reload_weights` refills parameters and buffers in place through the layerwise kernel-tensor
+copy, but tensors DERIVED at load time and held as plain attributes are re-derived into NEW tensors
+while the CUDA graphs keep the OLD pointers, whose memory was discarded: the fused-MoE quant
+config's `a1_gscale`/`a2_gscale` (read by the captured input-quant kernel) and MLA's absorbed
+`W_UV`/`W_UK_T` (read by the captured bmm). Eager steps use the new tensors, graph replays the
+stale ones -> HTTP 200 with garbage tokens. Independently, `expand(num_experts)` made the
+kernel-format MoE input scales stride-0 views, which Tensor.copy_ refuses as a destination
+("more than one element of the written-to tensor refers to a single memory location").
+
+Changes (behaviour gated by IMPALA_RELOAD_FIX=1; additive parts are always on):
+- flashinfer_fp4_moe: shared input scales via `.repeat` (port of #49489).
+- replace_parameter(prefer_copy=True): in-place refresh keeps data_ptr (port of #40390).
+- MLA: W_UV / W_UK_T are parameters refreshed in place on reload (port of #48251).
+- ModelOpt NVFP4 MoE: on a reload keep the MoE kernel the graphs were captured with and copy the
+  freshly processed quant-config tensors into its live ones (no upstream equivalent as of
+  2026-10-11: main still rebuilds the kernel, so its a1_gscale goes stale after a level-2 sleep).
+- layerwise reload: overlap-tolerant kernel-tensor copy (defensive).
+- Checksum hook v2 (IMPALA_WEIGHT_CHECKSUM=<dir>): parameters + buffers (Exp-4 digest) and derived
+  tensors (module attributes, quant-config descriptors, experts attributes) with data_ptr, callable
+  after wake_up + reload via /collective_rpc impala_weight_checksum.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ vllm/device_allocator/cumem.py                |  13 +-
+ .../layers/attention/mla_attention.py         |  25 ++-
+ .../layers/quantization/modelopt.py           |  84 ++++++++-
+ .../quantization/utils/flashinfer_fp4_moe.py  |  22 ++-
+ .../model_loader/base_loader.py               | 172 +++++++++++++++---
+ .../model_loader/reload/layerwise.py          |  58 +++++-
+ vllm/model_executor/utils.py                  |  18 +-
+ vllm/v1/worker/gpu_model_runner.py            |  20 +-
+ vllm/v1/worker/gpu_worker.py                  |  53 +++++-
+ 9 files changed, 422 insertions(+), 43 deletions(-)
+
+diff --git a/vllm/device_allocator/cumem.py b/vllm/device_allocator/cumem.py
+index b2202b7d0..e63e2c9b5 100644
+--- a/vllm/device_allocator/cumem.py
++++ b/vllm/device_allocator/cumem.py
+@@ -87,6 +87,17 @@ def use_memory_pool_with_allocator(
+         yield mem_pool, new_alloc
+ 
+ 
++def _impala_pin_backup() -> bool:
++    """Experiment 5 (Impala): pageable CPU backups under the reload fix (IMPALA_SLEEP_PAGEABLE_BACKUP=1 default) so a
++    checkpointed sleeping process carries no cudaHostAlloc'd pages; stock pinned backups otherwise."""
++    import os as _os
++
++    fix = _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1"
++    if _os.environ.get("IMPALA_SLEEP_PAGEABLE_BACKUP", "1" if fix else "0") == "1":
++        return False
++    return is_pin_memory_available()
++
++
+ class CuMemAllocator:
+     """
+     A singleton class that manages a memory pool for CUDA tensors.
+@@ -199,7 +210,7 @@ class CuMemAllocator:
+                     size_in_bytes,
+                     dtype=torch.uint8,
+                     device="cpu",
+-                    pin_memory=is_pin_memory_available(),
++                    pin_memory=_impala_pin_backup(),
+                 )
+                 cpu_ptr = cpu_backup_tensor.data_ptr()
+                 libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
+diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
+index 4afe23195..dc228838b 100644
+--- a/vllm/model_executor/layers/attention/mla_attention.py
++++ b/vllm/model_executor/layers/attention/mla_attention.py
+@@ -320,6 +320,27 @@ def _detect_output_quant_key(
+     return kFp8StaticTensorSym
+ 
+ 
++def _impala_reload_fix_enabled() -> bool:
++    """Experiment 5 (Impala): IMPALA_RELOAD_FIX=1 enables the in-place reload fixes."""
++    import os as _os
++
++    return _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1"
++
++
++def _impala_set_absorbed(layer: nn.Module, name: str, value: torch.Tensor) -> None:
++    """Experiment 5 (Impala) / upstream #48251: under the reload fix the absorbed MLA weights are parameters that a reload
++    refreshes IN PLACE (the captured bmm keeps its pointer); stock behaviour rebinds a fresh tensor."""
++    if not _impala_reload_fix_enabled():
++        setattr(layer, name, value)
++        return
++    from vllm.model_executor.utils import replace_parameter
++
++    old = getattr(layer, name, None)
++    if old is not None and not isinstance(old, nn.Parameter):
++        delattr(layer, name)
++    replace_parameter(layer, name, value, prefer_copy=True)
++
++
+ class MLAAttention(nn.Module, AttentionLayerBase):
+     """Multi-Head Latent Attention layer.
+ 
+@@ -898,9 +919,9 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+                 )
+         else:
+             # Convert from (L, N, V) to (N, L, V)
+-            self.W_UV = W_UV.transpose(0, 1)
++            _impala_set_absorbed(self, "W_UV", W_UV.transpose(0, 1))
+             # Convert from (L, N, P) to (N, P, L)
+-            self.W_UK_T = W_UK.permute(1, 2, 0)
++            _impala_set_absorbed(self, "W_UK_T", W_UK.permute(1, 2, 0))
+ 
+         # If we should not load quant weights, we initialize the scales to 1.0
+         # as the default value. See [Note: Register q/k/v/prob scales in state dict]
+diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
+index 242cc105e..9716f24d4 100644
+--- a/vllm/model_executor/layers/quantization/modelopt.py
++++ b/vllm/model_executor/layers/quantization/modelopt.py
+@@ -1208,6 +1208,66 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
+         return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
+ 
+ 
++def _impala_reload_fix_enabled() -> bool:
++    """Experiment 5 (Impala): IMPALA_RELOAD_FIX=1 enables the in-place reload fixes."""
++    import os as _os
++
++    return _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1"
++
++
++def _impala_overlap_copy_(dst: torch.Tensor, src: torch.Tensor) -> None:
++    """copy_ that tolerates an expanded (stride-0) destination: write its unique storage elements once."""
++    if torch._debug_has_internal_overlap(dst) == 0:
++        dst.copy_(src)
++        return
++    n = dst.untyped_storage().nbytes() // dst.element_size()
++    dst_flat = torch.as_strided(dst, (n,), (1,), 0)
++    if src.shape == dst.shape and src.stride() == dst.stride() and src.untyped_storage().nbytes() == dst.untyped_storage().nbytes():
++        src_flat = torch.as_strided(src, (n,), (1,), 0)
++    else:
++        idx = tuple(0 if st == 0 else slice(None) for st in dst.stride())
++        src_flat = src[idx].contiguous().reshape(-1)
++        if src_flat.numel() != n:
++            raise RuntimeError(f"overlap copy: dst storage {n} elements, src sub-view {src_flat.numel()}")
++        if not torch.equal(src, src[idx].expand_as(src)):
++            raise RuntimeError("overlap copy: source is not uniform along the destination's stride-0 dims")
++    dst_flat.copy_(src_flat)
++
++
++def _impala_refresh_quant_config_inplace(old_qc, new_qc, layer: torch.nn.Module) -> None:
++    """Experiment 5 (Impala): copy every tensor of the freshly built fused-MoE quant config into the tensor the LIVE quant
++    config references (same object the captured kernels read). Parameters of the layer are refreshed again by the
++    layerwise machinery afterwards (harmless). A shape/dtype mismatch rebinds the field and warns (graphs would be stale)."""
++    n_copied = n_same = n_rebound = 0
++    for desc_name in ("_a1", "_a2", "_w1", "_w2"):
++        od = getattr(old_qc, desc_name, None)
++        nd = getattr(new_qc, desc_name, None)
++        if od is None or nd is None:
++            continue
++        for field in list(vars(od).keys()):
++            ov = getattr(od, field, None)
++            nv = getattr(nd, field, None)
++            if not (isinstance(ov, torch.Tensor) and isinstance(nv, torch.Tensor)):
++                continue
++            if ov is nv:
++                n_same += 1
++                continue
++            if ov.shape == nv.shape and ov.dtype == nv.dtype and ov.device == nv.device:
++                _impala_overlap_copy_(ov, nv)
++                n_copied += 1
++            else:
++                logger.warning(
++                    "[impala-reload] %s.%s: shape/dtype changed on reload (%s/%s -> %s/%s); rebinding (captured graphs stale)",
++                    desc_name, field, tuple(ov.shape), ov.dtype, tuple(nv.shape), nv.dtype,
++                )
++                object.__setattr__(od, field, nv)
++                n_rebound += 1
++    logger.info_once(
++        "[impala-reload] fused-MoE quant config refreshed in place: %d tensors copied, %d shared, %d rebound",
++        n_copied, n_same, n_rebound,
++    )
++
++
+ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+     """
+     MoE Method for FP4 Quantization.
+@@ -1412,16 +1472,32 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+         replace_parameter(layer, "w2_input_scale", a2_scale)
+ 
+         # Setup modular kernel.
+-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
++        _impala_old_kernel = getattr(self, "moe_kernel", None)
++        _impala_old_qc = getattr(self, "moe_quant_config", None)
++        new_quant_config = self.get_fused_moe_quant_config(layer)
+         assert self.experts_cls is not None
+-        self.moe_kernel = make_nvfp4_moe_kernel(
+-            moe_quant_config=self.moe_quant_config,
++        new_kernel = make_nvfp4_moe_kernel(
++            moe_quant_config=new_quant_config,
+             moe_config=self.moe,
+             experts_cls=self.experts_cls,
+             shared_experts=layer.shared_experts,
+             routing_tables=layer._maybe_init_expert_routing_tables(),
+         )
+-        self.moe_kernel.fused_experts.process_weights_after_loading(layer)
++        new_kernel.fused_experts.process_weights_after_loading(layer)
++        if (
++            _impala_reload_fix_enabled()
++            and _impala_old_kernel is not None
++            and _impala_old_qc is not None
++        ):
++            # Experiment 5 (Impala): a RELOAD. Keep the kernel the CUDA graphs were captured with and refresh its
++            # quant-config tensors in place (a1/a2_gscale are not layer parameters; the generic layerwise copy
++            # only covers parameters/buffers). The layer's parameters are copied back into their original
++            # storage by _copy_and_restore_kernel_tensors right after this returns.
++            _impala_refresh_quant_config_inplace(_impala_old_qc, new_quant_config, layer)
++            del new_kernel
++        else:
++            self.moe_quant_config = new_quant_config
++            self.moe_kernel = new_kernel
+ 
+     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
+         return make_nvfp4_moe_quant_config(
+diff --git a/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py b/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
+index ef0bf2bf7..c943f8365 100644
+--- a/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
++++ b/vllm/model_executor/layers/quantization/utils/flashinfer_fp4_moe.py
+@@ -34,6 +34,20 @@ __all__ = [
+ ]
+ 
+ 
++def _impala_reload_fix_enabled() -> bool:
++    """Experiment 5 (Impala): IMPALA_RELOAD_FIX=1 enables the in-place reload fixes."""
++    import os as _os
++
++    return _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1"
++
++
++def _impala_broadcast_scale(scalar: torch.Tensor, num_experts: int) -> torch.Tensor:
++    """Shared per-expert scale: a writable `.repeat` under the reload fix (upstream #49489), stock stride-0 `.expand` otherwise."""
++    if _impala_reload_fix_enabled():
++        return scalar.repeat(num_experts)
++    return scalar.expand(num_experts)
++
++
+ def is_flashinfer_fp4_cutlass_moe_available() -> bool:
+     """Return `True` when FlashInfer CUTLASS NV-FP4 kernels can be used."""
+     return (
+@@ -108,8 +122,8 @@ def prepare_nvfp4_moe_layer_for_flashinfer_cutedsl(
+ 
+     # Global scaling factors (same as other FlashInfer backends).
+     num_experts = w13.shape[0]
+-    a13_scale = a13_scale.max().to(torch.float32).expand(num_experts)
+-    a2_scale = a2_scale.max().to(torch.float32).expand(num_experts)
++    a13_scale = _impala_broadcast_scale(a13_scale.max().to(torch.float32), num_experts)
++    a2_scale = _impala_broadcast_scale(a2_scale.max().to(torch.float32), num_experts)
+ 
+     half = w13.shape[1] // 2
+     w13 = torch.cat([w13[:, half:], w13[:, :half]], dim=1)
+@@ -335,8 +349,8 @@ def prepare_nvfp4_moe_layer_for_fi_or_cutlass(
+     # For some FI kernels, the input scales are shared by all experts.
+     if is_global_sf_supported_for_nvfp4_backend(backend):
+         num_experts = w13.shape[0]
+-        a13_scale = a13_scale.max().to(torch.float32).expand(num_experts)
+-        a2_scale = a2_scale.max().to(torch.float32).expand(num_experts)
++        a13_scale = _impala_broadcast_scale(a13_scale.max().to(torch.float32), num_experts)
++        a2_scale = _impala_broadcast_scale(a2_scale.max().to(torch.float32), num_experts)
+     else:
+         a13_scale = a13_scale.max(dim=1).values.to(torch.float32)
+ 
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index 8e5e23ff9..a428ba1ff 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from abc import ABC, abstractmethod
+ 
++import contextlib
+ import torch
+ import torch.nn as nn
+ 
+@@ -61,7 +62,8 @@ class BaseModelLoader(ABC):
+             log_model_inspection(model)
+ 
+             logger.debug("Loading weights on %s ...", load_device)
+-            self.load_weights(model, model_config)
++            with _impala_count_first_load(model):
++                self.load_weights(model, model_config)
+ 
+             # Log peak GPU memory after loading weights. This is needed
+             # to have test coverage on peak memory for online quantization.
+@@ -103,9 +105,66 @@ def _has_online_quant(model: nn.Module):
+     return False
+ 
+ 
+-def _impala_weight_checksum(model: nn.Module) -> None:
+-    """Experiment 4 (Impala): IMPALA_WEIGHT_CHECKSUM=<dir> -> write a per-rank report hashing every GPU parameter/buffer
+-    (64-bit position-mixed sum on the device) plus sha256 of a fixed sample, after process_weights_after_loading."""
++_IMPALA_CHECKSUM_VERSION = 2
++
++
++def _impala_h64(t: torch.Tensor) -> tuple[str, int]:
++    """64-bit position-mixed hash of a CUDA tensor's bytes (device side), plus its byte count."""
++    mask = (1 << 64) - 1
++    chunk = 1 << 26
++    u8 = t.detach().contiguous().view(-1).view(torch.uint8)
++    nb = u8.numel()
++    pad = (-nb) % 8
++    if pad:
++        u8 = torch.cat([u8, torch.zeros(pad, dtype=torch.uint8, device=u8.device)])
++    x = u8.view(torch.int64)
++    h = 0
++    for off in range(0, x.numel(), chunk):
++        c = x[off : off + chunk]
++        idx = torch.arange(off, off + c.numel(), device=c.device, dtype=torch.int64)
++        h = (h + int(((c * 0x5BD1E995) ^ (idx * 0x1B873593)).sum().item())) & mask
++    return f"{h:016x}", nb
++
++
++def _impala_derived_tensors(model: nn.Module) -> list[tuple[str, torch.Tensor]]:
++    """Derived (non-parameter, non-buffer) CUDA tensors reachable from the modules: plain tensor attributes, fused-MoE quant
++    config descriptors, and the experts objects' tensor attributes. These are what captured CUDA graphs read besides params."""
++    out: list[tuple[str, torch.Tensor]] = []
++    seen: set[int] = set()
++
++    def add(name: str, t) -> None:
++        if isinstance(t, torch.Tensor) and t.device.type == "cuda" and t.numel() > 0 and id(t) not in seen:
++            seen.add(id(t))
++            out.append((name, t))
++
++    for mod_name, mod in model.named_modules():
++        pb = set(mod._parameters.keys()) | set(mod._buffers.keys())
++        for k, v in list(vars(mod).items()):
++            if k in pb or k == "kv_cache":  # kv_cache: the attention layers' KV tensors (bound after load), not weights
++                continue
++            add(f"{mod_name}.<attr>{k}", v)
++        qm = getattr(mod, "quant_method", None)
++        qc = getattr(qm, "moe_quant_config", None)
++        if qc is not None:
++            for desc_name in ("_a1", "_a2", "_w1", "_w2"):
++                d = getattr(qc, desc_name, None)
++                if d is None:
++                    continue
++                for f, v in list(vars(d).items()):
++                    add(f"{mod_name}.<qc>{desc_name}.{f}", v)
++        kern = getattr(qm, "moe_kernel", None)
++        ex = getattr(kern, "fused_experts", None)
++        if ex is not None:
++            for f, v in list(vars(ex).items()):
++                add(f"{mod_name}.<experts>{f}", v)
++    out.sort(key=lambda kv: kv[0])
++    return out
++
++
++def _impala_weight_checksum(model: nn.Module, tag: str = "load") -> str | None:
++    """Experiment 4/5 (Impala): IMPALA_WEIGHT_CHECKSUM=<dir> -> write a per-rank report hashing every GPU parameter/buffer
++    (digest `all_tensors_sha256`, Exp-4 definition) and every derived CUDA tensor (digest `derived_sha256`), with data_ptr per
++    tensor, plus sha256 of a fixed sample. Returns the report path (None when the hook is inert)."""
+     import hashlib
+     import json
+     import os
+@@ -113,7 +172,7 @@ def _impala_weight_checksum(model: nn.Module) -> None:
+ 
+     out_dir = os.environ.get("IMPALA_WEIGHT_CHECKSUM")
+     if not out_dir:
+-        return
++        return None
+     from vllm.distributed import get_tensor_model_parallel_rank
+ 
+     t0 = time.time()
+@@ -121,26 +180,15 @@ def _impala_weight_checksum(model: nn.Module) -> None:
+     items = [(n, p.data) for n, p in model.named_parameters()]
+     items += [(n, b) for n, b in model.named_buffers()]
+     items.sort(key=lambda kv: kv[0])
+-    mask = (1 << 64) - 1
+-    chunk = 1 << 26
+     res: dict[str, dict] = {}
+     total = 0
+     for name, t in items:
+         entry = {"shape": list(t.shape), "dtype": str(t.dtype), "dev": str(t.device)}
+         if t.device.type == "cuda" and t.numel() > 0:
+-            u8 = t.detach().contiguous().view(-1).view(torch.uint8)
+-            nb = u8.numel()
+-            pad = (-nb) % 8
+-            if pad:
+-                u8 = torch.cat([u8, torch.zeros(pad, dtype=torch.uint8, device=u8.device)])
+-            x = u8.view(torch.int64)
+-            h = 0
+-            for off in range(0, x.numel(), chunk):
+-                c = x[off : off + chunk]
+-                idx = torch.arange(off, off + c.numel(), device=c.device, dtype=torch.int64)
+-                h = (h + int(((c * 0x5BD1E995) ^ (idx * 0x1B873593)).sum().item())) & mask
++            h, nb = _impala_h64(t)
+             entry["nbytes"] = nb
+-            entry["h64"] = f"{h:016x}"
++            entry["h64"] = h
++            entry["ptr"] = t.data_ptr()
+             total += nb
+         res[name] = entry
+     names = [n for n, t in items if t.device.type == "cuda" and t.numel() > 0]
+@@ -153,25 +201,103 @@ def _impala_weight_checksum(model: nn.Module) -> None:
+         sample[n] = hashlib.sha256(
+             t.detach().contiguous().view(-1).view(torch.uint8).cpu().numpy().tobytes()
+         ).hexdigest()
+-    digest = hashlib.sha256(json.dumps(res, sort_keys=True).encode()).hexdigest()
++    # digest over h64/shape/dtype only (ptr excluded) so it is comparable across processes
++    digest_src = {n: {k2: v for k2, v in e.items() if k2 != "ptr"} for n, e in res.items()}
++    digest = hashlib.sha256(json.dumps(digest_src, sort_keys=True).encode()).hexdigest()
++    derived: dict[str, dict] = {}
++    dtotal = 0
++    for name, t in _impala_derived_tensors(model):
++        h, nb = _impala_h64(t)
++        derived[name] = {"shape": list(t.shape), "dtype": str(t.dtype), "nbytes": nb, "h64": h, "ptr": t.data_ptr()}
++        dtotal += nb
++    dsrc = {n: {k2: v for k2, v in e.items() if k2 != "ptr"} for n, e in derived.items()}
++    ddigest = hashlib.sha256(json.dumps(dsrc, sort_keys=True).encode()).hexdigest()
+     report = {
++        "version": _IMPALA_CHECKSUM_VERSION,
++        "tag": tag,
+         "rank": rank,
+         "pid": os.getpid(),
+         "n_tensors": len(res),
+         "n_hashed": len(names),
+         "gpu_bytes": total,
+         "all_tensors_sha256": digest,
++        "n_derived": len(derived),
++        "derived_bytes": dtotal,
++        "derived_sha256": ddigest,
+         "sample_sha256": sample,
+         "tensors": res,
++        "derived": derived,
+         "elapsed_s": round(time.time() - t0, 1),
+         "pinned_loader": os.environ.get("IMPALA_PINNED_LOADER", "0"),
++        "reload_fix": os.environ.get("IMPALA_RELOAD_FIX", "0"),
+     }
+     os.makedirs(out_dir, exist_ok=True)
+-    path = os.path.join(out_dir, f"wchk-rank{rank}-{os.getpid()}.json")
++    suffix = "" if tag == "load" else f"-{tag}"
++    path = os.path.join(out_dir, f"wchk-rank{rank}-{os.getpid()}{suffix}.json")
+     with open(path + ".tmp", "w") as f:
+         json.dump(report, f, indent=0)
+     os.replace(path + ".tmp", path)
+     logger.info(
+-        "[impala-checksum] rank %d: %d tensors, %.1f GiB hashed, all-tensors sha256 %s (%.1f s) -> %s",
+-        rank, len(names), total / 1024**3, digest[:16], time.time() - t0, path,
++        "[impala-checksum] v2 tag=%s rank %d: %d tensors / %.1f GiB hashed, all-tensors %s, derived %d / %.1f MiB %s (%.1f s) -> %s",
++        tag, rank, len(names), total / 1024**3, digest[:16], len(derived), dtotal / 1024**2, ddigest[:16],
++        time.time() - t0, path,
+     )
++    return path
++
++
++@contextlib.contextmanager
++def _impala_count_first_load(model: nn.Module):
++    """Experiment 5 (Impala): count every layer's loaded elements during the first load (IMPALA_RELOAD_FIX=1) and store the
++    measured total as layer._impala_first_load_numel, the exact trigger total for a later layerwise reload."""
++    import os as _os
++
++    if _os.environ.get("IMPALA_RELOAD_FIX", "0") != "1":
++        yield
++        return
++    import inspect
++
++    from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS, get_numel_loaded
++    from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
++    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
++
++    counts: dict[int, int] = {}
++    wrapped: list[tuple[torch.Tensor, object]] = []
++
++    def make(layer, tensor):
++        original = getattr(tensor, "weight_loader", default_weight_loader)
++        sig = inspect.signature(original)
++
++        def counting_loader(*args, **kwargs):
++            bound = sig.bind(*args, **kwargs)
++            bound.apply_defaults()
++            n, ret = get_numel_loaded(original, bound)
++            counts[id(layer)] = counts.get(id(layer), 0) + n
++            return ret
++
++        return original, counting_loader
++
++    layers = list(model.modules())
++    for layer in layers:
++        for name, tensor in get_layer_tensors(layer).items():
++            if name in SKIP_TENSORS:
++                continue
++            original, cl = make(layer, tensor)
++            tensor.weight_loader = cl
++            wrapped.append((tensor, original))
++    try:
++        yield
++    finally:
++        for tensor, original in wrapped:
++            try:
++                if original is default_weight_loader and "weight_loader" not in tensor.__dict__:
++                    continue
++                tensor.weight_loader = original
++            except Exception:  # noqa: BLE001
++                pass
++        n_layers = 0
++        for layer in layers:
++            c = counts.get(id(layer), 0)
++            if c > 0:
++                layer._impala_first_load_numel = c
++                n_layers += 1
++        logger.info("[impala-reload] first-load totals recorded for %d layers", n_layers)
+diff --git a/vllm/model_executor/model_loader/reload/layerwise.py b/vllm/model_executor/model_loader/reload/layerwise.py
+index 2ebe25444..f9545ca4b 100644
+--- a/vllm/model_executor/model_loader/reload/layerwise.py
++++ b/vllm/model_executor/model_loader/reload/layerwise.py
+@@ -44,6 +44,26 @@ LAYERWISE_INFO: WeakKeyDictionary[torch.nn.Module, LayerReloadingInfo] = (
+ )
+ 
+ 
++_IMPALA_PENDING: dict[int, tuple[torch.nn.Module, LayerReloadingInfo]] = {}
++
++
++def _impala_reload_fix_enabled() -> bool:
++    import os as _os
++
++    return _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1"
++
++
++def _impala_flush_pending(except_info) -> None:
++    """Experiment 5 (Impala): process every ready layer except the one currently receiving loads."""
++    for key in list(_IMPALA_PENDING.keys()):
++        layer, info = _IMPALA_PENDING[key]
++        if info is except_info:
++            continue
++        del _IMPALA_PENDING[key]
++        if info.can_load():
++            _layerwise_process(layer, info)
++
++
+ def get_layerwise_info(layer: torch.nn.Module) -> LayerReloadingInfo:
+     """
+     Get information related to restoring and layerwise processing. If no previous
+@@ -121,6 +141,10 @@ def initialize_online_processing(layer: torch.nn.Module):
+     # Track loading progress to determine when to process/copy
+     info.load_numel = 0
+     info.load_numel_total = get_layer_size(layer)
++    _measured = getattr(layer, "_impala_first_load_numel", None)
++    if _impala_reload_fix_enabled() and _measured:
++        # Experiment 5 (Impala): exact trigger total measured at the first load (see base_loader._impala_count_first_load)
++        info.load_numel_total = _measured
+ 
+     # Wrap each parameter's weight loader
+     # Note that nested wrapping will occur for shared tensors
+@@ -175,6 +199,15 @@ def make_online_process_loader(layer: torch.nn.Module, param_name: str) -> Calla
+         )
+ 
+         # Process and copy when all weights are loaded
++        if _impala_reload_fix_enabled():
++            # Experiment 5 (Impala): defer processing of a ready layer until a load for another layer arrives, so a
++            # count overshoot cannot drop this layer's late loads (see _IMPALA_PENDING).
++            _impala_flush_pending(except_info=info)
++            if info.load_numel >= info.load_numel_total and not isinstance(  # type: ignore[operator]
++                layer, (Attention, MLAAttention)
++            ):
++                _IMPALA_PENDING[id(info)] = (layer, info)
++            return ret
+         if info.load_numel >= info.load_numel_total and not isinstance(  # type: ignore[operator]
+             layer, (Attention, MLAAttention)
+         ):
+@@ -200,6 +233,8 @@ def finalize_layerwise_processing(model: torch.nn.Module, model_config: ModelCon
+     if hasattr(model, "_original_do_torchao_reload"):
+         model._do_torchao_reload = model._original_do_torchao_reload
+ 
++    _impala_flush_pending(except_info=None)
++
+     deferred_attn: list[tuple[torch.nn.Module, LayerReloadingInfo]] = []
+ 
+     for layer in model.modules():
+@@ -348,13 +383,32 @@ def _copy_and_restore_kernel_tensors(layer: torch.nn.Module, info: LayerReloadin
+     assert info.kernel_tensors is not None
+     parameters, buffers = info.kernel_tensors
+     for name, param in parameters.items():
+-        param.data.copy_(getattr(layer, name))
++        _impala_overlap_copy(param.data, getattr(layer, name), name)
+     for name, buffer in buffers.items():
+-        buffer.data.copy_(getattr(layer, name))
++        _impala_overlap_copy(buffer.data, getattr(layer, name), name)
+ 
+     _place_kernel_tensors(layer, info)
+ 
+ 
++def _impala_overlap_copy(dst: torch.Tensor, src: torch.Tensor, name: str = "") -> None:
++    """copy_ that tolerates an expanded (stride-0) destination: write its unique storage elements once (Experiment 2/5)."""
++    if torch._debug_has_internal_overlap(dst) == 0:
++        dst.copy_(src)
++        return
++    n = dst.untyped_storage().nbytes() // dst.element_size()
++    dst_flat = torch.as_strided(dst, (n,), (1,), 0)
++    if src.shape == dst.shape and src.stride() == dst.stride() and src.untyped_storage().nbytes() == dst.untyped_storage().nbytes():
++        src_flat = torch.as_strided(src, (n,), (1,), 0)
++    else:
++        idx = tuple(0 if st == 0 else slice(None) for st in dst.stride())
++        src_flat = src[idx].contiguous().reshape(-1)
++        if src_flat.numel() != n:
++            raise RuntimeError(f"overlap copy for {name}: dst storage {n} elements, src sub-view {src_flat.numel()}")
++        if not torch.equal(src, src[idx].expand_as(src)):
++            raise RuntimeError(f"overlap copy for {name}: source is not uniform along the destination's stride-0 dims")
++    dst_flat.copy_(src_flat)
++
++
+ def _place_kernel_tensors(layer: torch.nn.Module, info: LayerReloadingInfo):
+     for name in get_layer_tensors(layer):
+         delattr(layer, name)
+diff --git a/vllm/model_executor/utils.py b/vllm/model_executor/utils.py
+index 0b844d149..b252ee909 100644
+--- a/vllm/model_executor/utils.py
++++ b/vllm/model_executor/utils.py
+@@ -45,7 +45,10 @@ def set_weight_attrs(
+ 
+ 
+ def replace_parameter(
+-    layer: torch.nn.Module, param_name: str, new_data: torch.Tensor | None
++    layer: torch.nn.Module,
++    param_name: str,
++    new_data: torch.Tensor | None,
++    prefer_copy: bool = False,
+ ):
+     """
+     Replace a parameter of a layer while maintaining the ability to reload the weight.
+@@ -67,9 +70,20 @@ def replace_parameter(
+ 
+     if isinstance(new_data, torch.nn.Parameter):
+         new_data = new_data.data
+-    new_param = torch.nn.Parameter(new_data, requires_grad=False)
+ 
+     old_param: torch.nn.Parameter | None = getattr(layer, param_name, None)
++    # Experiment 5 (Impala) / upstream #40390: copy in place so captured CUDA graphs keep a valid pointer across reloads
++    if (
++        prefer_copy
++        and old_param is not None
++        and old_param.shape == new_data.shape
++        and old_param.dtype == new_data.dtype
++        and old_param.device == new_data.device
++    ):
++        old_param.copy_(new_data)
++        return
++
++    new_param = torch.nn.Parameter(new_data, requires_grad=False)
+     if old_param is not None and hasattr(old_param, "weight_loader"):
+         weight_loader = old_param.weight_loader
+         set_weight_attrs(new_param, {"weight_loader": weight_loader})
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index caf3bfdfc..904a47ebb 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -391,6 +391,19 @@ class ExecuteModelState(NamedTuple):
+     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+ 
+ 
++def _impala_kv_tensor_pool(vllm_config):
++    """Experiment 5 (Impala) / upstream #59158: with the reload fix on, the worker runs initialize_kv_cache inside a "runtime"
++    pool (backed up on sleep); only the KV tensors themselves go into the discardable "kv_cache" pool (nested)."""
++    import os as _os
++    from contextlib import nullcontext
++
++    if _os.environ.get("IMPALA_RELOAD_FIX", "0") != "1" or not vllm_config.model_config.enable_sleep_mode:
++        return nullcontext()
++    from vllm.device_allocator.cumem import CuMemAllocator
++
++    return CuMemAllocator.get_instance().use_memory_pool(tag="kv_cache")
++
++
+ class GPUModelRunner(
+     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
+ ):
+@@ -6839,9 +6852,10 @@ class GPUModelRunner(
+ 
+         # Reinitialize need to after initialize_attn_backend
+         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)
+-        kv_caches = self.initialize_kv_cache_tensors(
+-            kv_cache_config, kernel_block_sizes
+-        )
++        with _impala_kv_tensor_pool(self.vllm_config):
++            kv_caches = self.initialize_kv_cache_tensors(
++                kv_cache_config, kernel_block_sizes
++            )
+ 
+         if (
+             self.speculative_config
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 19d0a6814..c154fb5ec 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -102,6 +102,13 @@ class AsyncIntermediateTensors(IntermediateTensors):
+         return object.__getattribute__(self, name)
+ 
+ 
++def _impala_runtime_tag() -> str:
++    """Experiment 5 (Impala): "runtime" (offloaded on sleep) under IMPALA_RELOAD_FIX=1, stock "kv_cache" otherwise."""
++    import os as _os
++
++    return "runtime" if _os.environ.get("IMPALA_RELOAD_FIX", "0") == "1" else "kv_cache"
++
++
+ class Worker(WorkerBase):
+     def __init__(
+         self,
+@@ -167,7 +174,11 @@ class Worker(WorkerBase):
+             }
+ 
+         allocator = CuMemAllocator.get_instance()
+-        allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
++        if _impala_runtime_tag() == "runtime":
++            # Experiment 5 (Impala) / upstream #59158: KV-init runtime state is kept at every level
++            allocator.sleep(offload_tags=("weights", "runtime") if level == 1 else ("runtime",))
++        else:
++            allocator.sleep(offload_tags=("weights",) if level == 1 else tuple())
+         free_bytes_after_sleep, total = torch.cuda.mem_get_info()
+         freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+         used_bytes = total - free_bytes_after_sleep
+@@ -328,6 +339,44 @@ class Worker(WorkerBase):
+     def reload_weights(self, *args, **kwargs) -> None:
+         self.model_runner.reload_weights(*args, **kwargs)
+ 
++    def impala_zero_kv_cache(self) -> str:
++        """Experiment 5 (Impala, diagnostic): zero every KV cache tensor (after wake_up the remapped pages hold leftovers)."""
++        n = 0
++        for t in getattr(self.model_runner, "kv_caches", []) or []:
++            if isinstance(t, torch.Tensor) and t.numel() > 0:
++                t.zero_()
++                n += t.numel() * t.element_size()
++        torch.cuda.synchronize()
++        return f"zeroed {n / 2**30:.1f} GiB"
++
++    def impala_memory_stats(self) -> str:
++        """Experiment 5 (Impala, diagnostic): allocator state + KV cache bytes bound (json)."""
++        import json as _json
++
++        st = torch.cuda.memory_stats()
++        free, total = torch.cuda.mem_get_info()
++        kv = sum(t.numel() * t.element_size() for t in (getattr(self.model_runner, "kv_caches", []) or []) if isinstance(t, torch.Tensor))
++        keys = ("allocated_bytes.all.current", "reserved_bytes.all.current", "inactive_split_bytes.all.current",
++                "segment.all.current", "num_alloc_retries", "num_ooms", "active_bytes.all.current")
++        out = {k: int(st.get(k, -1)) for k in keys}
++        out.update({"kv_cache_bytes": int(kv), "device_used_bytes": int(total - free)})
++        return _json.dumps(out)
++
++    def impala_empty_cache(self) -> str:
++        """Experiment 5 (Impala, diagnostic): torch.cuda.empty_cache(); returns reserved bytes before/after."""
++        before = int(torch.cuda.memory_stats().get("reserved_bytes.all.current", -1))
++        torch.cuda.synchronize()
++        torch.cuda.empty_cache()
++        after = int(torch.cuda.memory_stats().get("reserved_bytes.all.current", -1))
++        return f"reserved {before / 2**30:.1f} -> {after / 2**30:.1f} GiB"
++
++    def impala_weight_checksum(self, tag: str = "rpc") -> str:
++        """Experiment 5 (Impala): write the weight/derived-tensor checksum report (IMPALA_WEIGHT_CHECKSUM=<dir>) via RPC."""
++        from vllm.model_executor.model_loader.base_loader import _impala_weight_checksum
++
++        torch.cuda.synchronize()
++        return _impala_weight_checksum(self.model_runner.model, tag=str(tag)) or ""
++
+     @torch.inference_mode()
+     def determine_available_memory(self) -> int:
+         """Profiles the peak memory usage of the model to determine how much
+@@ -532,7 +581,7 @@ class Worker(WorkerBase):
+             from vllm.device_allocator.cumem import CuMemAllocator
+ 
+             allocator = CuMemAllocator.get_instance()
+-            with allocator.use_memory_pool(tag="kv_cache"):
++            with allocator.use_memory_pool(tag=_impala_runtime_tag()):
+                 self.model_runner.initialize_kv_cache(kv_cache_config)
+         else:
+             self.model_runner.initialize_kv_cache(kv_cache_config)
+-- 
+2.43.0
+

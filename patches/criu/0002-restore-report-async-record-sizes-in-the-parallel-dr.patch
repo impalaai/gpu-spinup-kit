@@ -1,0 +1,65 @@
+From d92e6447a632d663b8157d7c92334195ceff2629 Mon Sep 17 00:00:00 2001
+From: Tom <tom@getimpala.ai>
+Date: Tue, 25 Aug 2026 00:59:41 +0000
+Subject: [PATCH 2/6] restore: report async record sizes in the parallel drain
+ summary
+
+The parallel drain logs one summary line per task per drain cycle. On a
+multi-task restore the first such line belongs to whichever task drains
+first, typically a small one, which reads misleadingly as the whole
+restore's parallelism. Include the total and largest record size so the
+line identifies its own scope and an unsplit oversized record is visible
+at the default verbosity without extra instrumentation.
+
+Assisted-by: Claude:claude-fable-5
+---
+ criu/pagemap.c | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/criu/pagemap.c b/criu/pagemap.c
+index 373ea6841..3af0ae505 100644
+--- a/criu/pagemap.c
++++ b/criu/pagemap.c
+@@ -1825,6 +1825,7 @@ static int process_async_reads_parallel(struct page_read *pr, int fd)
+ 	struct async_drain d = { .fd = fd };
+ 	pthread_t *tids = NULL;
+ 	unsigned int nr_threads, started = 0, i = 0;
++	uint64_t total = 0, largest = 0;
+ 	sigset_t set, old;
+ 
+ 	list_for_each_entry(piov, &pr->async, l)
+@@ -1833,8 +1834,14 @@ static int process_async_reads_parallel(struct page_read *pr, int fd)
+ 	d.piovs = xmalloc(d.nr * sizeof(*d.piovs));
+ 	if (!d.piovs)
+ 		goto err_drain;
+-	list_for_each_entry(piov, &pr->async, l)
++	list_for_each_entry(piov, &pr->async, l) {
++		uint64_t sz = piov->end - piov->from;
++
+ 		d.piovs[i++] = piov;
++		total += sz;
++		if (sz > largest)
++			largest = sz;
++	}
+ 
+ 	nr_threads = d.nr < opts.premap_threads ? d.nr : opts.premap_threads;
+ 	if (nr_threads > 1) {
+@@ -1843,7 +1850,14 @@ static int process_async_reads_parallel(struct page_read *pr, int fd)
+ 			goto err_drain;
+ 	}
+ 
+-	pr_info("Reading %u async page records with %u threads\n", d.nr, nr_threads);
++	/*
++	 * The record count bounds the usable parallelism and the largest
++	 * record bounds the tail: log both so an unsplit record shows up
++	 * without extra instrumentation.
++	 */
++	pr_info("Reading %u async page records (%ju MB, largest %ju MB) with %u threads\n",
++		d.nr, (uintmax_t)(total >> 20), (uintmax_t)(largest >> 20),
++		nr_threads);
+ 
+ 	/*
+ 	 * Workers must not run the task's signal handlers; block everything
+-- 
+2.43.0
+
