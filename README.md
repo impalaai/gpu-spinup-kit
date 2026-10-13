@@ -19,7 +19,8 @@ Upstream status:
 
 * CRIU `--premap-threads`: [checkpoint-restore/criu#3208](https://github.com/checkpoint-restore/criu/pull/3208) (draft)
 * CRIU `--premap-hugepage`: [checkpoint-restore/criu#3209](https://github.com/checkpoint-restore/criu/pull/3209) (draft)
-* vLLM pinned-staging loader and sleep-reload fix: see `patches/vllm/README.md` for the current PR links
+* vLLM pinned-staging loader: [vllm-project/vllm#61303](https://github.com/vllm-project/vllm/pull/61303) (draft)
+* vLLM sleep-reload fix: [vllm-project/vllm#61304](https://github.com/vllm-project/vllm/pull/61304) (draft)
 
 Everything here was written during live experiments and is published as-is: it is a record of
 what worked, with the exact flags, not a packaged product. Paths assume a `spinup` user with a

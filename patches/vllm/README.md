@@ -13,7 +13,7 @@
 
 Upstream pull requests against `vllm-project/vllm` `main` (rebased, pending re-measure on hardware):
 
-* pinned-staging loader: see the "What we're open-sourcing" section of the blog post for the current link
-* sleep-reload fix: same
+* pinned-staging loader: [vllm-project/vllm#61303](https://github.com/vllm-project/vllm/pull/61303) (draft)
+* sleep-reload fix: [vllm-project/vllm#61304](https://github.com/vllm-project/vllm/pull/61304) (draft, stacked)
 
 Apply the 0.20.2 series with `git am` on tag `v0.20.2`; `0003` depends on `0001`.
